@@ -1,3 +1,7 @@
+# Modified by Edly, 2026.
+# Original source: https://github.com/Pearson-Advance/openedx-lti-tool-plugin
+# Changes: updated tests to match render_xblock fix, map_into_course, and
+#          sequential block type allowance.
 """Tests views module."""
 from unittest.mock import MagicMock, PropertyMock, patch
 
@@ -399,19 +403,25 @@ class TestResourceLinkLaunchViewGetOpaqueKeys(ResourceLinkLaunchViewBaseTestCase
         usage_key_mock: MagicMock,
         course_key_mock: MagicMock,
     ):
-        """Test with a UsageKey in resource_id argument."""
+        """Test with a UsageKey in resource_id argument.
+
+        map_into_course is called to normalise the key into the course context
+        (e.g. ensuring the 'run' component is present for older key formats).
+        """
         course_key_mock.from_string.side_effect = InvalidKeyError(None, None)
+        raw_usage_key = usage_key_mock.from_string.return_value
 
         self.assertEqual(
             self.view_class().get_opaque_keys(self.resource_id),
             (
-                usage_key_mock.from_string.return_value.course_key,
-                usage_key_mock.from_string.return_value,
+                raw_usage_key.course_key,
+                raw_usage_key.map_into_course.return_value,
             ),
         )
 
         course_key_mock.from_string.assert_called_once_with(self.resource_id)
         usage_key_mock.from_string.assert_called_once_with(self.resource_id)
+        raw_usage_key.map_into_course.assert_called_once_with(raw_usage_key.course_key)
 
     def test_with_course_key(
         self,
@@ -458,7 +468,16 @@ class TestResourceLinkLaunchViewValidateOpaqueKeys(ResourceLinkLaunchViewBaseTes
         self.assertIsNone(self.view_class.validate_opaque_keys(self.course_key, self.usage_key, ''))
         gettext_mock.assert_not_called()
 
-    @ddt.data('chapter', 'sequential', 'course')
+    def test_with_sequential_usage_key(self, gettext_mock: MagicMock):
+        """Test that sequential (subsection) block type is accepted.
+
+        Subsections are renderable via render_xblock and must not be rejected.
+        """
+        self.usage_key.block_type = 'sequential'
+        self.assertIsNone(self.view_class.validate_opaque_keys(self.course_key, self.usage_key, ''))
+        gettext_mock.assert_not_called()
+
+    @ddt.data('chapter', 'course')
     def test_with_invalid_usage_key(self, block_type: str, gettext_mock: MagicMock):
         """Test with invalid usage_key argument."""
         self.usage_key.block_type = block_type
@@ -907,7 +926,7 @@ class TestResourceLinkLaunchViewGetLaunchResponse(ResourceLinkLaunchViewBaseTest
             ),
             set_logged_in_cookies.return_value,
         )
-        redirect_mock.assert_called_once_with('render_xblock', str(self.usage_key.course_key))
+        redirect_mock.assert_called_once_with('render_xblock', str(self.usage_key))
         set_logged_in_cookies.assert_called_once_with(None, redirect_mock(), self.user)
 
     @patch.object(ResourceLinkLaunchView, 'get_course_launch_response')

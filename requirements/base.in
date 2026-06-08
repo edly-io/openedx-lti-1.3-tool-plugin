@@ -1,13 +1,15 @@
-# Core requirements for using this application
+# Modified by Edly, 2026.
+# Original source: https://github.com/Pearson-Advance/openedx-lti-tool-plugin
+# Changes: removed platform-provided packages and constraints reference to
+#          prevent pip from downgrading edx-platform packages during install.
+# Core requirements for using this application.
+#
+# Platform-provided packages (Django, edx-opaque-keys, edx-toggles, celery,
+# djangorestframework, edx-drf-extensions, jsonschema) are intentionally
+# omitted: they are already installed by edx-platform at the correct versions
+# for the running Open edX release.  Declaring them here (with or without
+# version pins) causes pip to downgrade or upgrade those packages during
+# plugin installation, breaking the platform.
 
--c constraints.txt
-
-Django                    # Web application framework
-pylti1p3                  # LTI 1.3 Advantage Tool implementation
-edx-opaque-keys           # Open edX course and XBlock identities API
-edx-toggles               # Library and utilities for implementing and reporting on feature toggles.
-celery                    # Asynchronous task execution library
-shortuuid                 # Library that generates concise, unambiguous, URL-safe UUIDs
-djangorestframework       # Django REST framework is a powerful and flexible toolkit for building Web APIs.
-edx-drf-extensions        # edX Django REST Framework Extensions
-jsonschema                # JSON Schema data validation
+pylti1p3    # LTI 1.3 Advantage Tool implementation — not bundled by edx-platform
+shortuuid   # Concise UUID generation used in LtiProfile — not bundled by edx-platform
