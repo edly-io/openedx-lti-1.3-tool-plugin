@@ -62,16 +62,17 @@ class ResourceLinkLaunchView(LTIToolView):
 
     """
 
-    def get(self, request: HttpRequest) -> Union[HttpResponseRedirect, LoggedHttpResponseBadRequest]:
+    def get(self, request: HttpRequest, resource_id: str = '') -> Union[HttpResponseRedirect, LoggedHttpResponseBadRequest]:
         """HTTP GET request method.
 
         Args:
             request: HTTP request object.
+            resource_id: Resource ID string from URL path.
 
         Returns:
             HTTP redirect response or HTTP 400 response.
         """
-        return self.post(request)
+        return self.post(request, resource_id=resource_id)
 
     def post(
         self,
