@@ -62,16 +62,17 @@ class ResourceLinkLaunchView(LTIToolView):
 
     """
 
-    def get(self, request: HttpRequest) -> Union[HttpResponseRedirect, LoggedHttpResponseBadRequest]:
+    def get(self, request: HttpRequest, resource_id: str = '') -> Union[HttpResponseRedirect, LoggedHttpResponseBadRequest]:
         """HTTP GET request method.
 
         Args:
             request: HTTP request object.
+            resource_id: Resource ID string from URL path.
 
         Returns:
             HTTP redirect response or HTTP 400 response.
         """
-        return self.post(request)
+        return self.post(request, resource_id=resource_id)
 
     def post(
         self,
@@ -514,7 +515,6 @@ class ResourceLinkLaunchView(LTIToolView):
                     user=user,
                     course_key=course_key,
                     check_access=True,
-                    request=request,
                 )
         except course_enrollment_exception() as exc:
             raise ResourceLinkException(_(f'Course enrollment failed: {exc}')) from exc
