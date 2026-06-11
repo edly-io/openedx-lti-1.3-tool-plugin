@@ -515,7 +515,6 @@ class ResourceLinkLaunchView(LTIToolView):
                     user=user,
                     course_key=course_key,
                     check_access=True,
-                    request=request,
                 )
         except course_enrollment_exception() as exc:
             raise ResourceLinkException(_(f'Course enrollment failed: {exc}')) from exc
