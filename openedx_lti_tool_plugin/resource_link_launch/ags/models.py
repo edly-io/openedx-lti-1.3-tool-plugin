@@ -21,6 +21,51 @@ from openedx_lti_tool_plugin.resource_link_launch.ags.validators import validate
 log = logging.getLogger(__name__)
 
 
+class LtiActivityLineitem(models.Model):
+    """Activity-level lineitem mapping, shared across all users of one Moodle context.
+
+    Created once per (Moodle platform, Moodle course context, problem). Maps each graded
+    problem in the launched content to its pre-created Moodle lineitem URL, and is reused
+    by every user who launches the same activity.
+    """
+
+    platform_id = models.CharField(
+        max_length=255,
+        help_text=_('LTI platform issuer (iss) — the Moodle server.'),
+    )
+    context_id = models.CharField(
+        max_length=255,
+        help_text=_('LTI context claim id — the specific Moodle course.'),
+    )
+    resource_id = models.CharField(
+        max_length=255,
+        help_text=_('The launched Open edX course/content ID.'),
+    )
+    problem_id = models.CharField(
+        max_length=255,
+        help_text=_('Usage key of the individual graded problem.'),
+    )
+    lineitem = models.URLField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_('Pre-created Moodle lineitem URL for this problem.'),
+    )
+    label = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        """Model metadata options."""
+
+        app_label = app_config.name
+        verbose_name = 'LTI activity lineitem'
+        verbose_name_plural = 'LTI activity lineitems'
+        unique_together = ['platform_id', 'context_id', 'problem_id']
+
+    def __str__(self) -> str:
+        """Model string representation."""
+        return f'<LtiActivityLineitem, ID: {self.id}>'
+
+
 class LtiGradedResourceManager(models.Manager):
     """A manager for the LtiGradedResource model."""
 

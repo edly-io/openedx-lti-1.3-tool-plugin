@@ -45,7 +45,9 @@ from openedx_lti_tool_plugin.waffle import ALLOW_COMPLETE_COURSE_LAUNCH, COURSE_
 log = logging.getLogger(__name__)
 AGS_CLAIM_ENDPOINT = 'https://purl.imsglobal.org/spec/lti-ags/claim/endpoint'
 AGS_SCORE_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/score'
+AGS_LINEITEM_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/lineitem'
 CUSTOM_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/custom'
+CONTEXT_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/context'
 
 
 @method_decorator([csrf_exempt, xframe_options_exempt], name='dispatch')
@@ -618,3 +620,20 @@ class ResourceLinkLaunchView(LTIToolView):
             )
         except ValidationError as exc:
             raise ResourceLinkException(_(exc.messages[0])) from exc
+
+        lineitems_url = ags_endpoint.get('lineitems', '')
+        if lineitems_url and AGS_LINEITEM_SCOPE in ags_endpoint.get('scope', []):
+            try:
+                CourseKey.from_string(resource_id)  # only course launches need per-problem lineitems
+            except InvalidKeyError:
+                return
+            # Lazy import to avoid a circular import (tasks imports from this module's package).
+            from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (  # pylint: disable=import-outside-toplevel
+                setup_problem_lineitems,
+            )
+            setup_problem_lineitems.delay(
+                lti_profile.id,
+                resource_id,
+                claims.get(CONTEXT_CLAIM, {}).get('id', ''),
+                lineitems_url,
+            )
