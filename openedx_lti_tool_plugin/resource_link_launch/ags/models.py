@@ -21,6 +21,48 @@ from openedx_lti_tool_plugin.resource_link_launch.ags.validators import validate
 log = logging.getLogger(__name__)
 
 
+class LtiActivityLineitem(models.Model):
+    """Activity-level lineitem mapping (shared across users).
+
+    Created once during the first launch of an LTI activity with FULL grade sync.
+    Maps each graded problem in the launched content to its pre-created Moodle lineitem URL.
+    """
+
+    lti_profile = models.ForeignKey(
+        LtiProfile,
+        on_delete=models.CASCADE,
+        related_name='openedx_lti_tool_plugin_activity_lineitem',
+        help_text=_('The LTI profile associated with this activity.'),
+    )
+    resource_id = models.CharField(
+        max_length=255,
+        help_text=_('The launched course/content ID (e.g. course-v1:Org+Course+Run).'),
+    )
+    problem_id = models.CharField(
+        max_length=255,
+        help_text=_('Usage key of the individual graded problem.'),
+    )
+    lineitem = models.URLField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_('Pre-created Moodle lineitem URL for this problem.'),
+    )
+    label = models.CharField(max_length=255, blank=True, default='')
+
+    class Meta:
+        """Model metadata options."""
+
+        app_label = app_config.name
+        verbose_name = 'LTI activity lineitem'
+        verbose_name_plural = 'LTI activity lineitems'
+        unique_together = ['lti_profile', 'resource_id', 'problem_id']
+
+    def __str__(self) -> str:
+        """Model string representation."""
+        return f'<LtiActivityLineitem, ID: {self.id}>'
+
+
 class LtiGradedResourceManager(models.Manager):
     """A manager for the LtiGradedResource model."""
 
