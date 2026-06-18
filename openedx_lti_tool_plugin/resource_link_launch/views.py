@@ -35,7 +35,7 @@ from openedx_lti_tool_plugin.edxapp_wrapper.student_module import course_enrollm
 from openedx_lti_tool_plugin.edxapp_wrapper.user_authn_module import set_logged_in_cookies
 from openedx_lti_tool_plugin.http import LoggedHttpResponseBadRequest
 from openedx_lti_tool_plugin.models import LtiProfile, LtiToolConfiguration, UserT
-from openedx_lti_tool_plugin.resource_link_launch.ags.models import LtiActivityLineitem, LtiGradedResource
+from openedx_lti_tool_plugin.resource_link_launch.ags.models import LtiGradedResource
 from openedx_lti_tool_plugin.resource_link_launch.exceptions import ResourceLinkException
 from openedx_lti_tool_plugin.resource_link_launch.utils import validate_resource_link_message
 from openedx_lti_tool_plugin.utils import get_identity_claims
@@ -47,13 +47,7 @@ AGS_CLAIM_ENDPOINT = 'https://purl.imsglobal.org/spec/lti-ags/claim/endpoint'
 AGS_SCORE_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/score'
 AGS_LINEITEM_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/lineitem'
 CUSTOM_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/custom'
-
-
-def get_graded_problems(course_key):
-    """Return all graded problem blocks in the course."""
-    from xmodule.modulestore.django import modulestore  # pylint: disable=import-outside-toplevel
-    items = modulestore().get_items(course_key, qualifiers={'category': 'problem'})
-    return [item for item in items if item.graded or item.weight]
+CONTEXT_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/context'
 
 
 @method_decorator([csrf_exempt, xframe_options_exempt], name='dispatch')
@@ -629,64 +623,17 @@ class ResourceLinkLaunchView(LTIToolView):
 
         lineitems_url = ags_endpoint.get('lineitems', '')
         if lineitems_url and AGS_LINEITEM_SCOPE in ags_endpoint.get('scope', []):
-            ResourceLinkLaunchView.setup_problem_lineitems(message, lti_profile, resource_id)
-
-    @staticmethod
-    def setup_problem_lineitems(
-        message: DjangoMessageLaunch,
-        lti_profile: LtiProfile,
-        resource_id: str,
-    ):
-        """Create per-problem Moodle lineitems and per-user LtiGradedResource records.
-
-        Runs on first launch and is idempotent on re-launch. Only called when the
-        launch JWT contains a `lineitems` collection URL with lineitem write scope
-        (requires FULL grade sync in Moodle).
-
-        Args:
-            message: DjangoMessageLaunch object (carries AGS service context).
-            lti_profile: LtiProfile instance for the current user.
-            resource_id: The launched course or content ID.
-
-        """
-        from pylti1p3.lineitem import LineItem  # pylint: disable=import-outside-toplevel
-
-        try:
-            course_key = CourseKey.from_string(resource_id)
-        except InvalidKeyError:
-            return  # Single-block launches do not need per-problem lineitems
-
-        problems = get_graded_problems(course_key)
-
-        for problem in problems:
-            problem_id = str(problem.location)
-            label = problem.display_name or problem_id
-            score_max = float(problem.weight) if problem.weight else 1.0
-
-            activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
-                lti_profile=lti_profile,
-                resource_id=resource_id,
-                problem_id=problem_id,
-                defaults={'label': label, 'lineitem': ''},
-            )
-
-            if created or not activity_lineitem.lineitem:
-                li = LineItem()
-                li.set_tag(problem_id)
-                li.set_score_maximum(score_max)
-                li.set_label(label)
-                result = message.get_ags().find_or_create_lineitem(li, find_by='tag')
-                activity_lineitem.lineitem = result.get_id()
-                activity_lineitem.save()
-
             try:
-                LtiGradedResource.objects.get_or_create(
-                    lti_profile=lti_profile,
-                    context_key=problem_id,
-                    lineitem=activity_lineitem.lineitem,
-                )
-            except ValidationError as exc:
-                log.warning(
-                    'LTI AGS: skipping LtiGradedResource for problem %s: %s',
-                    problem_id, exc.messages,
-                )
+                CourseKey.from_string(resource_id)  # only course launches need per-problem lineitems
+            except InvalidKeyError:
+                return
+            # Lazy import to avoid a circular import (tasks imports from this module's package).
+            from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (  # pylint: disable=import-outside-toplevel
+                setup_problem_lineitems,
+            )
+            setup_problem_lineitems.delay(
+                lti_profile.id,
+                resource_id,
+                claims.get(CONTEXT_CLAIM, {}).get('id', ''),
+                lineitems_url,
+            )

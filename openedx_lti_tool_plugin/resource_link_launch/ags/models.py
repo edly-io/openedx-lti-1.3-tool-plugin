@@ -22,21 +22,24 @@ log = logging.getLogger(__name__)
 
 
 class LtiActivityLineitem(models.Model):
-    """Activity-level lineitem mapping (shared across users).
+    """Activity-level lineitem mapping, shared across all users of one Moodle context.
 
-    Created once during the first launch of an LTI activity with FULL grade sync.
-    Maps each graded problem in the launched content to its pre-created Moodle lineitem URL.
+    Created once per (Moodle platform, Moodle course context, problem). Maps each graded
+    problem in the launched content to its pre-created Moodle lineitem URL, and is reused
+    by every user who launches the same activity.
     """
 
-    lti_profile = models.ForeignKey(
-        LtiProfile,
-        on_delete=models.CASCADE,
-        related_name='openedx_lti_tool_plugin_activity_lineitem',
-        help_text=_('The LTI profile associated with this activity.'),
+    platform_id = models.CharField(
+        max_length=255,
+        help_text=_('LTI platform issuer (iss) — the Moodle server.'),
+    )
+    context_id = models.CharField(
+        max_length=255,
+        help_text=_('LTI context claim id — the specific Moodle course.'),
     )
     resource_id = models.CharField(
         max_length=255,
-        help_text=_('The launched course/content ID (e.g. course-v1:Org+Course+Run).'),
+        help_text=_('The launched Open edX course/content ID.'),
     )
     problem_id = models.CharField(
         max_length=255,
@@ -56,7 +59,7 @@ class LtiActivityLineitem(models.Model):
         app_label = app_config.name
         verbose_name = 'LTI activity lineitem'
         verbose_name_plural = 'LTI activity lineitems'
-        unique_together = ['lti_profile', 'resource_id', 'problem_id']
+        unique_together = ['platform_id', 'context_id', 'problem_id']
 
     def __str__(self) -> str:
         """Model string representation."""
