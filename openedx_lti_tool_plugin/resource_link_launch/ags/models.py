@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timezone
 from typing import Optional, Union
 
@@ -110,6 +111,16 @@ class LtiGradedResource(models.Model):
         max_length=255,
         help_text=_('The AGS lineitem URL.'),
     )
+    last_score_given = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=_('Last score value successfully sent to the platform (used to skip redundant publishes).'),
+    )
+    last_score_maximum = models.FloatField(
+        null=True,
+        blank=True,
+        help_text=_('Score maximum of the last score successfully sent to the platform.'),
+    )
 
     class Meta:
         """Model metadata options."""
@@ -159,7 +170,7 @@ class LtiGradedResource(models.Model):
         score_maximum: Union[int, float],
         activity_progress: str = 'Submitted',
         grading_progress: str = 'FullyGraded',
-        timestamp: datetime = datetime.now(tz=timezone.utc),
+        timestamp: Optional[datetime] = None,
         event_id: str = '',
     ):
         """
@@ -181,6 +192,30 @@ class LtiGradedResource(models.Model):
             https://www.imsglobal.org/spec/lti-ags/v2p0/#score-publish-service
 
         """
+        given = float(given_score)
+        maximum = float(score_maximum)
+        # Skip redundant publishes: if the score is unchanged since the last successful
+        # send there is nothing new for the platform to record. Mirrors Moodle's
+        # enrol_lti `lastgrade` guard and avoids needless AGS traffic.
+        if (
+            self.last_score_given is not None
+            and self.last_score_maximum is not None
+            and math.isclose(self.last_score_given, given, rel_tol=1e-9, abs_tol=1e-12)
+            and math.isclose(self.last_score_maximum, maximum, rel_tol=1e-9, abs_tol=1e-12)
+        ):
+            log.info(
+                'LTI AGS score unchanged for user %s lineitem %s; skipping publish.',
+                self.lti_profile.subject_id,
+                self.lineitem,
+            )
+            return
+
+        # Evaluate per call: a datetime default in the signature is bound once at import
+        # time, so every call would reuse that stale timestamp and the platform (e.g.
+        # Moodle) would reject later updates as "not newer" (409).
+        if timestamp is None:
+            timestamp = datetime.now(tz=timezone.utc)
+
         log_extra = {
             'event_id': event_id,
             'given_score': given_score,
@@ -211,6 +246,10 @@ class LtiGradedResource(models.Model):
             # Send score publish request to LTI platform.
             message.get_ags().put_grade(grade)
             log.info(f'LTI AGS score publish request success: {log_extra}')
+            # Record the sent score so identical subsequent publishes are skipped.
+            self.last_score_given = given
+            self.last_score_maximum = maximum
+            self.save(update_fields=['last_score_given', 'last_score_maximum'])
         except LtiException as exc:
             log_extra['exception'] = str(exc)
             log.error(f'LTI AGS score publish request failure: {log_extra}')

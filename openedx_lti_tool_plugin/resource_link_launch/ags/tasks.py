@@ -24,18 +24,29 @@ AGS_SCORE_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/score'
 AGS_LINEITEM_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/lineitem'
 
 
-def get_graded_problems(course_key: CourseKey) -> list:
-    """Return all graded problem blocks in the course.
+def get_gradable_blocks(course_key: CourseKey) -> list:
+    """Return all gradable, scored blocks in the course.
+
+    A block is included when it produces a score (``has_score``) and either counts
+    toward the grade (``graded``) or carries a weight. This intentionally covers more
+    than native ``problem`` blocks: consumed LTI tools (``lti_consumer``) and any other
+    scored XBlock are included too, so each becomes its own lineitem on the target
+    platform. This is what lets Open edX act as a bridge, relaying grades from an
+    upstream LTI tool out to the downstream platform.
 
     Args:
         course_key: CourseKey of the launched course.
 
     Returns:
-        List of graded problem blocks.
+        List of gradable block instances.
 
     """
-    items = modulestore().get_items(course_key, qualifiers={'category': 'problem'})
-    return [item for item in items if item.graded or item.weight]
+    return [
+        block
+        for block in modulestore().get_items(course_key)
+        if getattr(block, 'has_score', False)
+        and (getattr(block, 'graded', False) or getattr(block, 'weight', None))
+    ]
 
 
 @shared_task(name=f'{MODULE_PATH}.setup_problem_lineitems')
@@ -45,12 +56,13 @@ def setup_problem_lineitems(
     context_id: str,
     lineitems_url: str,
 ):
-    """Create per-problem Moodle lineitems and per-user LtiGradedResource records.
+    """Create per-block target lineitems and per-user LtiGradedResource records.
 
-    Runs asynchronously after a course launch with FULL grade sync. For each graded
-    problem in the course, creates (once, shared across users) a Moodle lineitem via
+    Runs asynchronously after a course launch with FULL grade sync. For each gradable
+    block in the course (native problems as well as consumed LTI tools and other scored
+    blocks), creates (once, shared across users) a lineitem on the target platform via
     pylti1p3's ``find_or_create_lineitem`` and a per-user ``LtiGradedResource`` so that
-    ``send_problem_score_update`` can post that problem's score to its own column.
+    ``send_problem_score_update`` can post that block's score to its own column.
 
     The AGS message is rebuilt from a JWT carrying the ``lineitems`` collection URL,
     mirroring ``LtiGradedResource.publish_score``.
@@ -58,7 +70,7 @@ def setup_problem_lineitems(
     Args:
         lti_profile_id: ID of the launching user's LtiProfile.
         resource_id: The launched Open edX course ID.
-        context_id: LTI context claim id (the Moodle course).
+        context_id: LTI context claim id (the target platform's course/context).
         lineitems_url: AGS lineitems collection URL from the launch JWT.
 
     """
@@ -69,7 +81,7 @@ def setup_problem_lineitems(
     if not lti_profile:
         return
 
-    problems = get_graded_problems(CourseKey.from_string(resource_id))
+    blocks = get_gradable_blocks(CourseKey.from_string(resource_id))
 
     # JWT carrying the lineitems collection URL — mirrors publish_score_jwt.
     jwt = {
@@ -89,35 +101,35 @@ def setup_problem_lineitems(
         .validate_registration()\
         .get_ags()
 
-    for problem in problems:
-        problem_id = str(problem.location)
-        label = problem.display_name or problem_id
+    for block in blocks:
+        block_id = str(block.location)
+        label = block.display_name or block_id
 
         activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
             platform_id=lti_profile.platform_id,
             context_id=context_id,
-            problem_id=problem_id,
+            problem_id=block_id,
             defaults={'resource_id': resource_id, 'label': label},
         )
 
         if created or not activity_lineitem.lineitem:
             lineitem = LineItem()
-            lineitem.set_tag(problem_id)
+            lineitem.set_tag(block_id)
             lineitem.set_label(label)
-            lineitem.set_score_maximum(float(problem.weight) if problem.weight else 1.0)
+            lineitem.set_score_maximum(float(getattr(block, 'weight', None) or 1.0))
             activity_lineitem.lineitem = ags.find_or_create_lineitem(lineitem, find_by='tag').get_id()
             activity_lineitem.save()
 
         try:
             LtiGradedResource.objects.get_or_create(
                 lti_profile=lti_profile,
-                context_key=problem_id,
+                context_key=block_id,
                 lineitem=activity_lineitem.lineitem,
             )
         except ValidationError as exc:
             log.warning(
-                'LTI AGS: skipping LtiGradedResource for problem %s: %s',
-                problem_id,
+                'LTI AGS: skipping LtiGradedResource for block %s: %s',
+                block_id,
                 exc.messages,
             )
 

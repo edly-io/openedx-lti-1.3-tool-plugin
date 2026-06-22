@@ -1,4 +1,5 @@
 """Tests models module."""
+from datetime import timezone
 from unittest.mock import MagicMock, PropertyMock, call, patch
 
 from django.test import TestCase
@@ -295,3 +296,52 @@ class TestLtiGradedResourcePublishScore(TestLtiGradedResourceBaseTestCase):
                 f'LTI AGS score publish request failure: {exception_log_extra}',
             ),
         )
+
+
+@patch(f'{MODULE_PATH}.Grade')
+@patch(f'{MODULE_PATH}.DjangoMessageLaunch')
+@patch(f'{MODULE_PATH}.DjangoDbToolConf')
+class TestLtiGradedResourcePublishScoreGuard(TestLtiGradedResourceBaseTestCase):
+    """Test publish_score timestamp freshness and unchanged-score guard."""
+
+    @patch(f'{MODULE_PATH}.datetime')
+    def test_timestamp_evaluated_per_call(
+        self,
+        datetime_mock: MagicMock,
+        tool_conf_mock: MagicMock,
+        message_mock: MagicMock,
+        grade_mock: MagicMock,
+    ):
+        """publish_score stamps each call with the current time.
+
+        Regression: a `datetime` default in the signature is bound once at import
+        time; publish_score must evaluate `datetime.now` during the call instead.
+        """
+        self.lti_graded_resource.publish_score(0.5, 1.0)
+
+        datetime_mock.now.assert_called_once_with(tz=timezone.utc)
+
+    def test_skips_publish_when_score_unchanged(
+        self,
+        tool_conf_mock: MagicMock,
+        message_mock: MagicMock,
+        grade_mock: MagicMock,
+    ):
+        """A second identical score is not re-sent to the platform."""
+        self.lti_graded_resource.publish_score(0.5, 1.0)
+        self.lti_graded_resource.publish_score(0.5, 1.0)
+
+        # DjangoMessageLaunch is only constructed when an actual send happens.
+        message_mock.assert_called_once()
+
+    def test_publishes_again_when_score_changes(
+        self,
+        tool_conf_mock: MagicMock,
+        message_mock: MagicMock,
+        grade_mock: MagicMock,
+    ):
+        """A changed score is sent again."""
+        self.lti_graded_resource.publish_score(0.5, 1.0)
+        self.lti_graded_resource.publish_score(0.8, 1.0)
+
+        self.assertEqual(message_mock.call_count, 2)
