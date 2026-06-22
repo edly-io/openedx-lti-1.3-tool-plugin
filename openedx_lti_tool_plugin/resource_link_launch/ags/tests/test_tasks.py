@@ -5,11 +5,37 @@ from django.test import TestCase
 from testfixtures import log_capture
 from testfixtures.logcapture import LogCaptureForDecorator
 
-from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import send_problem_score_update, send_vertical_score_update
+from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (
+    get_gradable_blocks,
+    send_problem_score_update,
+    send_vertical_score_update,
+)
 from openedx_lti_tool_plugin.resource_link_launch.ags.tests import MODULE_PATH
 from openedx_lti_tool_plugin.tests import COURSE_ID, USAGE_KEY
 
 MODULE_PATH = f'{MODULE_PATH}.tasks'
+
+
+class TestGetGradableBlocks(TestCase):
+    """Test get_gradable_blocks function."""
+
+    @patch(f'{MODULE_PATH}.modulestore')
+    def test_filters_scored_gradable_blocks(self, modulestore_mock: MagicMock):
+        """Returns only scored blocks that are graded or weighted (any block type)."""
+        course_key = MagicMock()
+        problem = MagicMock(has_score=True, graded=True, weight=None)            # native problem
+        lti_tool = MagicMock(has_score=True, graded=True, weight=1.0)            # consumed LTI tool
+        weighted_only = MagicMock(has_score=True, graded=False, weight=2.0)      # scored + weighted
+        ungraded_scored = MagicMock(has_score=True, graded=False, weight=None)   # excluded
+        content = MagicMock(has_score=False, graded=True, weight=1.0)            # excluded (no score)
+        modulestore_mock().get_items.return_value = [
+            problem, lti_tool, weighted_only, ungraded_scored, content,
+        ]
+
+        result = get_gradable_blocks(course_key)
+
+        self.assertEqual(result, [problem, lti_tool, weighted_only])
+        modulestore_mock().get_items.assert_called_once_with(course_key)
 
 
 class TestSendVerticalScoreUpdate(TestCase):
