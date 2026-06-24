@@ -16,4 +16,9 @@ urlpatterns = [
         views.CourseContentItemViewSet.as_view({'get': 'list'}),
         name='course-content-item-list',
     ),
+    path(
+        '<uuid:launch_id>/content_items/courses/<str:course_id>/blocks',
+        views.CourseBlockContentItemViewSet.as_view({'get': 'list'}),
+        name='course-block-content-item-list',
+    ),
 ]

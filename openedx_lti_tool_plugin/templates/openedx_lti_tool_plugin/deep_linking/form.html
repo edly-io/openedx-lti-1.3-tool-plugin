@@ -14,14 +14,29 @@
 <div class='container my-4'>
   <div class='row'>
     <div class='col'>
-      <form
-      id='deepLinkingForm'
-      action='{% url "openedx_lti_tool_plugin:1.3:deep-linking:form" launch_id=launch_id %}'
-      method='post'>
-        {% csrf_token %}
-        <div id='deepLinkingFormTable' class='mb-4'></div>
-        <input type='submit' class='btn btn-primary' value='{% translate "Submit" %}'>
-      </form>
+
+      {# Step 1: pick a course #}
+      <div id='coursesView'>
+        <h5 class='mb-3'>{% translate 'Select a course' %}</h5>
+        <p class='text-muted'>{% translate 'Click a course to browse its units and components.' %}</p>
+        <div id='coursesTable' class='mb-4'></div>
+      </div>
+
+      {# Step 2: pick unit(s)/component(s) within the chosen course #}
+      <div id='blocksView' style='display:none'>
+        <button type='button' id='backToCourses' class='btn btn-link px-0 mb-2'>&larr; {% translate 'Back to courses' %}</button>
+        <h5 class='mb-3'>{% translate 'Select content from' %} <span id='selectedCourseTitle'></span></h5>
+        <p class='text-muted'>{% translate 'Tick the units or components you want to embed. Sections and subsections are for navigation only.' %}</p>
+        <form
+        id='deepLinkingForm'
+        action='{% url "openedx_lti_tool_plugin:1.3:deep-linking:form" launch_id=launch_id %}'
+        method='post'>
+          {% csrf_token %}
+          <div id='blocksTable' class='mb-4'></div>
+          <input type='submit' class='btn btn-primary' value='{% translate "Add selected" %}'>
+        </form>
+      </div>
+
     </div>
   </div>
 </div>
@@ -31,32 +46,58 @@
 {{ block.super }}
 <script src='https://cdnjs.cloudflare.com/ajax/libs/tabulator/6.2.5/js/tabulator.min.js' integrity='sha512-orG5sHJgUiyGjeUBBK56+piLmrCEP7r5Tz9efhJ/C7F1Hdi8O33gQxqZThRb/PSAg9T5seRewR2pw5lTaZPTMQ==' crossorigin='anonymous' referrerpolicy='no-referrer'></script>
 <script>
-  // Set table pagination size.
   const paginationSize = 25;
-  // Initialize Tabulator.
-  const table = new Tabulator('#deepLinkingFormTable', {
-    ajaxURL: '{% url "openedx_lti_tool_plugin:1.3:deep-linking:api:v1:course-content-item-list" launch_id=launch_id %}',
-    // Modify AJAX response data.
-    ajaxResponse: function(url, params, response){
+  const courseListUrl = '{% url "openedx_lti_tool_plugin:1.3:deep-linking:api:v1:course-content-item-list" launch_id=launch_id %}';
+
+  // Per-course blocks endpoint: .../courses/<course_id>/blocks
+  function blocksUrl(courseId) {
+    return courseListUrl + '/' + encodeURIComponent(courseId) + '/blocks';
+  }
+
+  function showView(name) {
+    document.getElementById('coursesView').style.display = (name === 'courses') ? '' : 'none';
+    document.getElementById('blocksView').style.display = (name === 'blocks') ? '' : 'none';
+  }
+
+  // Step 1 — courses table (paginated). Clicking a row drills into that course.
+  const coursesTable = new Tabulator('#coursesTable', {
+    ajaxURL: courseListUrl,
+    ajaxResponse: function(url, params, response) {
       return Object.assign({}, {
-        // Add total number of pages to response data.
         last_page: Math.floor((response.count + paginationSize - 1) / paginationSize),
-        // Rename response `results` key to `data` key.
         data: response.results,
       });
     },
-    // Modify default query params.
-    dataSendParams:{
-      'size':'page_size',
-    },
-    // Set column data.
+    dataSendParams: {'size': 'page_size'},
     columns: [
-      {title: 'Title', field: 'title'},
-      {title: 'URL', field: 'url'},
+      {title: '{% translate "Course" %}', field: 'title', widthGrow: 1},
     ],
-    // Make rows selectable.
+    progressiveLoad: 'load',
+    paginationSize: paginationSize,
+    layout: 'fitDataStretch',
+  });
+
+  coursesTable.on('rowClick', function(e, row) {
+    const data = row.getData();
+    loadBlocks(data.custom.resourceId, data.title);
+  });
+
+  // Step 2 — nested block outline (chapter -> sequential -> unit -> component).
+  const blocksTable = new Tabulator('#blocksTable', {
+    dataTree: true,
+    dataTreeChildField: '_children',
+    dataTreeStartExpanded: true,
+    layout: 'fitColumns',
+    columns: [
+      {title: '{% translate "Name" %}', field: 'title', widthGrow: 3, responsive: 0},
+      {title: '{% translate "Type" %}', field: 'category', widthGrow: 1, hozAlign: 'center'},
+    ],
+    // Only embeddable nodes (units/components) can be selected; containers cannot.
     selectableRows: true,
-    rowHeader:{
+    selectableRowsCheck: function(row) {
+      return row.getData().selectable;
+    },
+    rowHeader: {
       formatter: 'rowSelection',
       titleFormatter: 'rowSelection',
       headerSort: false,
@@ -65,17 +106,32 @@
       headerHozAlign: 'center',
       hozAlign: 'center',
     },
-    // Enable table pagination.
-    progressiveLoad: 'load',
-    paginationSize: paginationSize,
-    // Fit columns to data and stretch last column.
-    layout: 'fitDataStretch',
   });
-  // Modify formData before submit.
-  document.querySelector('#deepLinkingForm').addEventListener('formdata', (e) => {
-    const formData = e.formData;
-    // Set form `content_items` key value to a JSON string with selected rows data.
-    formData.set('content_items', JSON.stringify(table.getSelectedData()));
+
+  function loadBlocks(courseId, courseTitle) {
+    fetch(blocksUrl(courseId), {credentials: 'same-origin', headers: {'Accept': 'application/json'}})
+      .then(function(response) {
+        if (!response.ok) { throw new Error('{% translate "Failed to load course content." %}'); }
+        return response.json();
+      })
+      .then(function(data) {
+        document.getElementById('selectedCourseTitle').textContent = courseTitle;
+        blocksTable.setData(data);
+        showView('blocks');
+      })
+      .catch(function(error) { window.alert(error.message); });
+  }
+
+  document.getElementById('backToCourses').addEventListener('click', function() {
+    showView('courses');
+  });
+
+  // On submit, serialize selected nodes into LTI content items.
+  document.querySelector('#deepLinkingForm').addEventListener('formdata', function(e) {
+    const items = blocksTable.getSelectedData().map(function(d) {
+      return {type: 'ltiResourceLink', url: d.url, title: d.title, custom: d.custom};
+    });
+    e.formData.set('content_items', JSON.stringify(items));
   });
 </script>
 {% endblock %}

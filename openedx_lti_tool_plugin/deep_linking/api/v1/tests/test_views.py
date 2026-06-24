@@ -5,15 +5,32 @@ from uuid import uuid4
 from django.http.response import Http404
 from django.test import RequestFactory, TestCase, override_settings
 from django.urls import reverse
+from rest_framework.exceptions import NotFound
 
 from openedx_lti_tool_plugin.deep_linking.api.v1.pagination import ContentItemPagination
 from openedx_lti_tool_plugin.deep_linking.api.v1.serializers import CourseContentItemSerializer
 from openedx_lti_tool_plugin.deep_linking.api.v1.tests import MODULE_PATH
-from openedx_lti_tool_plugin.deep_linking.api.v1.views import CourseContentItemViewSet
+from openedx_lti_tool_plugin.deep_linking.api.v1.views import (
+    CourseBlockContentItemViewSet,
+    CourseContentItemViewSet,
+    get_course_block_tree,
+)
 from openedx_lti_tool_plugin.models import CourseContext
-from openedx_lti_tool_plugin.tests import AUD, ISS
+from openedx_lti_tool_plugin.tests import AUD, COURSE_ID, ISS
 
 MODULE_PATH = f'{MODULE_PATH}.views'
+
+
+def _fake_block(block_type, usage_id, display_name, children):
+    """Build a fake modulestore block (XBlock-like MagicMock)."""
+    location = MagicMock()
+    location.block_type = block_type
+    location.__str__.return_value = usage_id
+    block = MagicMock()
+    block.location = location
+    block.display_name_with_default = display_name
+    block.get_children.return_value = children
+    return block
 
 
 class TestCourseContentItemViewSet(TestCase):
@@ -60,3 +77,88 @@ class TestCourseContentItemViewSet(TestCase):
         """Test raise 404 response when plugin is disabled."""
         with self.assertRaises(Http404):
             self.view_class.as_view({'get': 'list'})(self.request)
+
+
+class TestGetCourseBlockTree(TestCase):
+    """Test get_course_block_tree function."""
+
+    @patch(f'{MODULE_PATH}.modulestore')
+    def test_builds_nested_tree(self, modulestore_mock: MagicMock):
+        """Returns a nested outline marking only embeddable nodes selectable."""
+        problem = _fake_block('problem', 'block@problem', 'Problem 1', [])
+        unit = _fake_block('vertical', 'block@vertical', 'Unit 1', [problem])
+        chapter = _fake_block('chapter', 'block@chapter', 'Section 1', [unit])
+        course = MagicMock()
+        course.get_children.return_value = [chapter]
+        modulestore_mock().get_course.return_value = course
+
+        tree = get_course_block_tree('course-key', 'http://launch')
+
+        # chapter: container, not selectable
+        self.assertEqual(len(tree), 1)
+        self.assertEqual(tree[0]['category'], 'chapter')
+        self.assertFalse(tree[0]['selectable'])
+        # unit: selectable, carries content-item fields
+        unit_node = tree[0]['_children'][0]
+        self.assertTrue(unit_node['selectable'])
+        self.assertEqual(unit_node['type'], 'ltiResourceLink')
+        self.assertEqual(unit_node['url'], 'http://launch')
+        self.assertEqual(unit_node['custom'], {'resourceId': 'block@vertical'})
+        # problem: selectable leaf
+        problem_node = unit_node['_children'][0]
+        self.assertTrue(problem_node['selectable'])
+        self.assertEqual(problem_node['custom'], {'resourceId': 'block@problem'})
+
+
+class TestCourseBlockContentItemViewSet(TestCase):
+    """Test CourseBlockContentItemViewSet class."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        super().setUp()
+        self.view_class = CourseBlockContentItemViewSet
+        self.launch_data = {}
+        self.view_self = MagicMock(launch_data=self.launch_data)
+        self.request = MagicMock()
+        self.course_id = COURSE_ID
+
+    @patch(f'{MODULE_PATH}.reverse')
+    @patch(f'{MODULE_PATH}.get_course_block_tree')
+    @patch(f'{MODULE_PATH}.CourseKey')
+    @patch.object(CourseContext.objects, 'all_for_lti_tool')
+    @patch(f'{MODULE_PATH}.get_identity_claims')
+    def test_list(
+        self,
+        get_identity_claims_mock: MagicMock,
+        all_for_lti_tool_mock: MagicMock,
+        course_key_mock: MagicMock,
+        get_course_block_tree_mock: MagicMock,
+        reverse_mock: MagicMock,
+    ):
+        """Test list returns the block tree for an allowed course."""
+        get_identity_claims_mock.return_value = ISS, AUD, None, None
+        course_context = MagicMock(course_id=self.course_id)
+        all_for_lti_tool_mock.return_value.filter_by_site_orgs.return_value = [course_context]
+
+        response = self.view_class.list(self.view_self, self.request, course_id=self.course_id)
+
+        course_key_mock.from_string.assert_called_once_with(self.course_id)
+        get_course_block_tree_mock.assert_called_once_with(
+            course_key_mock.from_string.return_value,
+            self.request.build_absolute_uri.return_value,
+        )
+        self.assertEqual(response.data, get_course_block_tree_mock.return_value)
+
+    @patch.object(CourseContext.objects, 'all_for_lti_tool')
+    @patch(f'{MODULE_PATH}.get_identity_claims')
+    def test_list_course_not_allowed(
+        self,
+        get_identity_claims_mock: MagicMock,
+        all_for_lti_tool_mock: MagicMock,
+    ):
+        """Test list raises NotFound when the course is not available for the tool."""
+        get_identity_claims_mock.return_value = ISS, AUD, None, None
+        all_for_lti_tool_mock.return_value.filter_by_site_orgs.return_value = []
+
+        with self.assertRaises(NotFound):
+            self.view_class.list(self.view_self, self.request, course_id=self.course_id)
