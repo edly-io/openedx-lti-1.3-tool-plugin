@@ -17,8 +17,8 @@ from openedx_lti_tool_plugin.models import CourseContext
 from openedx_lti_tool_plugin.utils import get_identity_claims
 
 # Block categories the instructor may embed as their own LTI resource link.
-# Structural containers (course/chapter/sequential) are kept for navigation only.
-EMBEDDABLE_BLOCK_TYPES = ('vertical', 'problem', 'html', 'video')
+# Chapters (sections) stay as navigation-only containers.
+EMBEDDABLE_BLOCK_TYPES = ('sequential', 'vertical', 'problem', 'html', 'video')
 
 
 def block_node(block, launch_url: str) -> dict:

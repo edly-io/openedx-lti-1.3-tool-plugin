@@ -48,6 +48,8 @@
 <script>
   const paginationSize = 25;
   const courseListUrl = '{% url "openedx_lti_tool_plugin:1.3:deep-linking:api:v1:course-content-item-list" launch_id=launch_id %}';
+  // When the launch resolves to a single course, the picker is scoped to it.
+  const scopedCourseId = '{{ course_id|escapejs }}';
 
   // Per-course blocks endpoint: .../courses/<course_id>/blocks
   function blocksUrl(courseId) {
@@ -59,28 +61,30 @@
     document.getElementById('blocksView').style.display = (name === 'blocks') ? '' : 'none';
   }
 
-  // Step 1 — courses table (paginated). Clicking a row drills into that course.
-  const coursesTable = new Tabulator('#coursesTable', {
-    ajaxURL: courseListUrl,
-    ajaxResponse: function(url, params, response) {
-      return Object.assign({}, {
-        last_page: Math.floor((response.count + paginationSize - 1) / paginationSize),
-        data: response.results,
-      });
-    },
-    dataSendParams: {'size': 'page_size'},
-    columns: [
-      {title: '{% translate "Course" %}', field: 'title', widthGrow: 1},
-    ],
-    progressiveLoad: 'load',
-    paginationSize: paginationSize,
-    layout: 'fitDataStretch',
-  });
+  // Step 1 — courses table (paginated). Only used when the launch is not course-scoped.
+  if (!scopedCourseId) {
+    const coursesTable = new Tabulator('#coursesTable', {
+      ajaxURL: courseListUrl,
+      ajaxResponse: function(url, params, response) {
+        return Object.assign({}, {
+          last_page: Math.floor((response.count + paginationSize - 1) / paginationSize),
+          data: response.results,
+        });
+      },
+      dataSendParams: {'size': 'page_size'},
+      columns: [
+        {title: '{% translate "Course" %}', field: 'title', widthGrow: 1},
+      ],
+      progressiveLoad: 'load',
+      paginationSize: paginationSize,
+      layout: 'fitDataStretch',
+    });
 
-  coursesTable.on('rowClick', function(e, row) {
-    const data = row.getData();
-    loadBlocks(data.custom.resourceId, data.title);
-  });
+    coursesTable.on('rowClick', function(e, row) {
+      const data = row.getData();
+      loadBlocks(data.custom.resourceId, data.title);
+    });
+  }
 
   // Step 2 — nested block outline (chapter -> sequential -> unit -> component).
   const blocksTable = new Tabulator('#blocksTable', {
@@ -125,6 +129,12 @@
   document.getElementById('backToCourses').addEventListener('click', function() {
     showView('courses');
   });
+
+  // Course-scoped launch: skip the course list and load that course's content directly.
+  if (scopedCourseId) {
+    document.getElementById('backToCourses').style.display = 'none';
+    loadBlocks(scopedCourseId, scopedCourseId);
+  }
 
   // On submit, serialize selected nodes into LTI content items.
   document.querySelector('#deepLinkingForm').addEventListener('formdata', function(e) {
