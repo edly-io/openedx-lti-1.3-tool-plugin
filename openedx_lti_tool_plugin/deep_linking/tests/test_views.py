@@ -12,9 +12,46 @@ from openedx_lti_tool_plugin.apps import OpenEdxLtiToolPluginConfig as app_confi
 from openedx_lti_tool_plugin.deep_linking.exceptions import DeepLinkingException
 from openedx_lti_tool_plugin.deep_linking.forms import DeepLinkingForm
 from openedx_lti_tool_plugin.deep_linking.tests import MODULE_PATH
-from openedx_lti_tool_plugin.deep_linking.views import DeepLinkingFormView, DeepLinkingView
+from openedx_lti_tool_plugin.deep_linking.views import (
+    CUSTOM_CLAIM,
+    TARGET_LINK_URI_CLAIM,
+    DeepLinkingFormView,
+    DeepLinkingView,
+    get_scoped_course_id,
+)
 
 MODULE_PATH = f'{MODULE_PATH}.views'
+
+COURSE_KEY = 'course-v1:Org+Course+Run'
+BLOCK_KEY = 'block-v1:Org+Course+Run+type@problem+block@abc'
+
+
+class TestGetScopedCourseId(TestCase):
+    """Test get_scoped_course_id function."""
+
+    def test_from_custom_course_id(self):
+        """Returns the course_id custom parameter."""
+        data = {CUSTOM_CLAIM: {'course_id': COURSE_KEY}}
+        self.assertEqual(get_scoped_course_id(data), COURSE_KEY)
+
+    def test_from_custom_resource_id(self):
+        """Falls back to the resourceId custom parameter."""
+        data = {CUSTOM_CLAIM: {'resourceId': COURSE_KEY}}
+        self.assertEqual(get_scoped_course_id(data), COURSE_KEY)
+
+    def test_from_target_link_uri(self):
+        """Falls back to the course in the target_link_uri launch path."""
+        data = {TARGET_LINK_URI_CLAIM: f'https://lms.test/openedx_lti_tool_plugin/1.3/launch/{COURSE_KEY}'}
+        self.assertEqual(get_scoped_course_id(data), COURSE_KEY)
+
+    def test_ignores_block_target(self):
+        """A block-level target is not a CourseKey, so returns ''."""
+        data = {TARGET_LINK_URI_CLAIM: f'https://lms.test/openedx_lti_tool_plugin/1.3/launch/{BLOCK_KEY}'}
+        self.assertEqual(get_scoped_course_id(data), '')
+
+    def test_empty_when_absent(self):
+        """Returns '' when no course can be resolved."""
+        self.assertEqual(get_scoped_course_id({}), '')
 
 
 @patch.object(DeepLinkingView, 'get_message')
@@ -121,10 +158,12 @@ class TestDeepLinkingFormViewGet(TestCase):
             reverse('1.3:deep-linking:form', args=[self.launch_id]),
         )
 
+    @patch(f'{MODULE_PATH}.get_scoped_course_id')
     @patch(f'{MODULE_PATH}.render')
     def test_with_deep_linking_request(
         self,
         render_mock: MagicMock,
+        get_scoped_course_id_mock: MagicMock,
         configuration_helpers_mock: MagicMock,
         validate_deep_linking_message_mock: MagicMock,
         get_message_from_cache_mock: MagicMock,
@@ -140,11 +179,15 @@ class TestDeepLinkingFormViewGet(TestCase):
             'OLTITP_DEEP_LINKING_FORM_TEMPLATE',
             settings.OLTITP_DEEP_LINKING_FORM_TEMPLATE,
         )
+        get_scoped_course_id_mock.assert_called_once_with(
+            get_message_from_cache_mock().get_launch_data(),
+        )
         render_mock.assert_called_once_with(
             self.request,
             configuration_helpers_mock().get_value(),
             {
                 'launch_id': self.launch_id,
+                'course_id': get_scoped_course_id_mock.return_value,
             },
         )
 
