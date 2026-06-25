@@ -496,6 +496,31 @@ class CourseContextQuerySet(models.QuerySet):
 
         return self
 
+    def filter_by_org(self, org: str) -> models.QuerySet:
+        """Filter QuerySet to CourseContext objects belonging to a single org.
+
+        Used to scope the Deep Linking picker per tenant from a launch parameter.
+        Returns an empty QuerySet when `org` is falsy, so callers fail closed
+        (an unscoped launch sees no courses rather than every course).
+
+        Args:
+            org: Organization short name to filter by.
+
+        Returns:
+            QuerySet of CourseContext objects in `org`, or none() when `org` is empty.
+
+        """
+        if not org:
+            return self.none()
+
+        return self.filter(
+            pk__in=[
+                course_context.pk
+                for course_context in self
+                if course_context.org == org
+            ]
+        )
+
 
 class CourseContext(course_context()):
     """CourseContext Model."""

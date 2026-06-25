@@ -11,9 +11,11 @@ from openedx_lti_tool_plugin.deep_linking.api.v1.pagination import ContentItemPa
 from openedx_lti_tool_plugin.deep_linking.api.v1.serializers import CourseContentItemSerializer
 from openedx_lti_tool_plugin.deep_linking.api.v1.tests import MODULE_PATH
 from openedx_lti_tool_plugin.deep_linking.api.v1.views import (
+    CUSTOM_CLAIM,
     CourseBlockContentItemViewSet,
     CourseContentItemViewSet,
     get_course_block_tree,
+    scoped_course_queryset,
 )
 from openedx_lti_tool_plugin.models import CourseContext
 from openedx_lti_tool_plugin.tests import AUD, COURSE_ID, ISS
@@ -77,6 +79,57 @@ class TestCourseContentItemViewSet(TestCase):
         """Test raise 404 response when plugin is disabled."""
         with self.assertRaises(Http404):
             self.view_class.as_view({'get': 'list'})(self.request)
+
+
+class TestScopedCourseQueryset(TestCase):
+    """Test scoped_course_queryset function."""
+
+    @patch.object(CourseContext.objects, 'all_for_lti_tool')
+    @patch(f'{MODULE_PATH}.get_identity_claims')
+    def test_without_org_filter(
+        self,
+        get_identity_claims_mock: MagicMock,
+        all_for_lti_tool_mock: MagicMock,
+    ):
+        """With the org-filter setting off, returns the tool + site-org scoped queryset."""
+        get_identity_claims_mock.return_value = ISS, AUD, None, None
+        site_scoped = all_for_lti_tool_mock.return_value.filter_by_site_orgs.return_value
+
+        self.assertEqual(scoped_course_queryset({}), site_scoped)
+        site_scoped.filter_by_org.assert_not_called()
+
+    @override_settings(OLTITP_DEEP_LINKING_FILTER_BY_ORG_PARAM=True)
+    @patch.object(CourseContext.objects, 'all_for_lti_tool')
+    @patch(f'{MODULE_PATH}.get_identity_claims')
+    def test_with_org_param(
+        self,
+        get_identity_claims_mock: MagicMock,
+        all_for_lti_tool_mock: MagicMock,
+    ):
+        """With the setting on, scopes to the launch's org custom parameter."""
+        get_identity_claims_mock.return_value = ISS, AUD, None, None
+        site_scoped = all_for_lti_tool_mock.return_value.filter_by_site_orgs.return_value
+
+        result = scoped_course_queryset({CUSTOM_CLAIM: {'org': 'MyOrg'}})
+
+        site_scoped.filter_by_org.assert_called_once_with('MyOrg')
+        self.assertEqual(result, site_scoped.filter_by_org.return_value)
+
+    @override_settings(OLTITP_DEEP_LINKING_FILTER_BY_ORG_PARAM=True)
+    @patch.object(CourseContext.objects, 'all_for_lti_tool')
+    @patch(f'{MODULE_PATH}.get_identity_claims')
+    def test_with_setting_on_but_no_org(
+        self,
+        get_identity_claims_mock: MagicMock,
+        all_for_lti_tool_mock: MagicMock,
+    ):
+        """With the setting on and no org param, filters by '' (fail closed)."""
+        get_identity_claims_mock.return_value = ISS, AUD, None, None
+        site_scoped = all_for_lti_tool_mock.return_value.filter_by_site_orgs.return_value
+
+        scoped_course_queryset({})
+
+        site_scoped.filter_by_org.assert_called_once_with('')
 
 
 class TestGetCourseBlockTree(TestCase):

@@ -1,4 +1,5 @@
 """Django Views."""
+from django.conf import settings
 from django.db.models import QuerySet
 from django.urls import reverse
 from edx_rest_framework_extensions.auth.jwt.authentication import JwtAuthentication
@@ -16,9 +17,37 @@ from openedx_lti_tool_plugin.edxapp_wrapper.modulestore_module import modulestor
 from openedx_lti_tool_plugin.models import CourseContext
 from openedx_lti_tool_plugin.utils import get_identity_claims
 
+CUSTOM_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/custom'
+
 # Block categories the instructor may embed as their own LTI resource link.
 # Chapters (sections) stay as navigation-only containers.
 EMBEDDABLE_BLOCK_TYPES = ('sequential', 'vertical', 'problem', 'html', 'video')
+
+
+def scoped_course_queryset(launch_data: dict) -> QuerySet:
+    """Return the CourseContext QuerySet a launch may pick from.
+
+    Always scoped to the LtiTool (iss/aud) and the site orgs. When
+    OLTITP_DEEP_LINKING_FILTER_BY_ORG_PARAM is enabled, it is additionally scoped to
+    the org passed as an ``org`` custom parameter — and returns nothing if no org is
+    provided (fail-closed multi-tenant isolation, so unconfigured launches see no
+    courses rather than every course).
+
+    Args:
+        launch_data: Deep linking launch message data.
+
+    Returns:
+        CourseContext QuerySet.
+
+    """
+    iss, aud, _sub, _pii = get_identity_claims(launch_data)
+    queryset = CourseContext.objects.all_for_lti_tool(iss, aud).filter_by_site_orgs()
+
+    if getattr(settings, 'OLTITP_DEEP_LINKING_FILTER_BY_ORG_PARAM', False):
+        org = (launch_data.get(CUSTOM_CLAIM, {}) or {}).get('org', '')
+        queryset = queryset.filter_by_org(org)
+
+    return queryset
 
 
 def block_node(block, launch_url: str) -> dict:
@@ -93,12 +122,9 @@ class CourseContentItemViewSet(
             CourseContext QuerySet.
 
         """
-        # Obtain the Issuer and Audience claim from the launch data
-        # these claims will be used by the CourseContext.all_for_lti_tool method
-        # to query the pylti1.3 LtiTool model related to this launch data.
-        iss, aud, _sub, _pii = get_identity_claims(self.launch_data)
-
-        return CourseContext.objects.all_for_lti_tool(iss, aud).filter_by_site_orgs()
+        # Scoped to the LtiTool + site orgs, and (when enabled) to the launch's `org`
+        # custom parameter — returning nothing if no org is provided.
+        return scoped_course_queryset(self.launch_data)
 
 
 class CourseBlockContentItemViewSet(DeepLinkingViewSet):
@@ -132,10 +158,9 @@ class CourseBlockContentItemViewSet(DeepLinkingViewSet):
 
         """
         course_id = kwargs.get('course_id', '')
-        iss, aud, _sub, _pii = get_identity_claims(self.launch_data)
         allowed_course_ids = [
             str(course_context.course_id)
-            for course_context in CourseContext.objects.all_for_lti_tool(iss, aud).filter_by_site_orgs()
+            for course_context in scoped_course_queryset(self.launch_data)
         ]
 
         if course_id not in allowed_course_ids:
