@@ -762,6 +762,36 @@ class TestCourseContextQuerySetFilterBySiteOrgs(TestCase):
         self.queryset_self.filter.assert_not_called()
 
 
+class TestCourseContextQuerySetFilterByOrg(TestCase):
+    """Test CourseContextQuerySet.filter_by_org method."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        super().setUp()
+        self.queryset_class = CourseContextQuerySet
+        self.queryset_self = MagicMock()
+        self.course_context = MagicMock(pk='test-pk', org=ORG)
+
+    def test_with_matching_org(self):
+        """Test filtering to CourseContext objects in the given org."""
+        self.queryset_self.__iter__.return_value = [self.course_context]
+
+        self.assertEqual(
+            self.queryset_class.filter_by_org(self.queryset_self, ORG),
+            self.queryset_self.filter.return_value,
+        )
+        self.queryset_self.filter.assert_called_once_with(pk__in=[self.course_context.pk])
+
+    def test_with_empty_org_fails_closed(self):
+        """Test an empty org returns none() (no courses) without filtering."""
+        self.assertEqual(
+            self.queryset_class.filter_by_org(self.queryset_self, ''),
+            self.queryset_self.none.return_value,
+        )
+        self.queryset_self.none.assert_called_once_with()
+        self.queryset_self.filter.assert_not_called()
+
+
 class TestCourseContext(TestCase):
     """Test CourseContext class."""
 

@@ -74,6 +74,7 @@ OLTITP_LOGIN_PROMPT_TEMPLATE = 'openedx_lti_tool_plugin/resource_link/login_prom
 
 # Deep linking settings
 OLTITP_DEEP_LINKING_FORM_TEMPLATE = 'openedx_lti_tool_plugin/deep_linking/form.html'
+OLTITP_DEEP_LINKING_FILTER_BY_ORG_PARAM = False
 
 # Backend settings
 OLTITP_TEST_BACKEND_MODULE_PATH = 'openedx_lti_tool_plugin.tests.backends_for_tests'

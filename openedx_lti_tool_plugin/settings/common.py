@@ -48,6 +48,10 @@ def plugin_settings(settings: LazySettings):
 
     # Deep linking settings
     settings.OLTITP_DEEP_LINKING_FORM_TEMPLATE = 'openedx_lti_tool_plugin/deep_linking/form.html'
+    # When True, the Deep Linking picker only shows courses of the org passed as an
+    # `org` custom parameter on the launch, and shows nothing if no org is provided
+    # (fail-closed multi-tenant scoping).
+    settings.OLTITP_DEEP_LINKING_FILTER_BY_ORG_PARAM = False
 
     # Backends settings
     settings.OLTITP_CORE_SIGNALS_BACKEND = f'{BACKENDS_MODULE_PATH}.core_signals_module_o_v1'
