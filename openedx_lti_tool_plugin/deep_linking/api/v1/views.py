@@ -80,19 +80,33 @@ def block_node(block, launch_url: str) -> dict:
 
 
 def get_course_block_tree(course_key: CourseKey, launch_url: str) -> list:
-    """Return the nested block outline of a course (chapter -> sequential -> unit -> component).
+    """Return the course outline as a single selectable course root with nested blocks.
+
+    The root node is the course itself (selectable — embeds the whole course), and its
+    children are the chapters -> sequentials -> units -> components. So the instructor can
+    either pick the whole course or expand and pick specific units/problems.
 
     Args:
         course_key: CourseKey of the course to traverse.
         launch_url: The resource link launch URL.
 
     Returns:
-        List of root-level block nodes (the course chapters).
+        A single-item list with the course root node.
 
     """
     course = modulestore().get_course(course_key, depth=None)
+    course_id = str(course_key)
 
-    return [block_node(child, launch_url) for child in course.get_children()]
+    return [{
+        'id': course_id,
+        'title': course.display_name_with_default or course_id,
+        'category': 'course',
+        'selectable': True,
+        'type': 'ltiResourceLink',
+        'url': launch_url,
+        'custom': {'resourceId': course_id},
+        '_children': [block_node(child, launch_url) for child in course.get_children()],
+    }]
 
 
 class CourseContentItemViewSet(

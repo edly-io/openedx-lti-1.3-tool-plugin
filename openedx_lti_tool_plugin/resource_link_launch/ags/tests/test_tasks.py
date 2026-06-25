@@ -7,6 +7,7 @@ from testfixtures.logcapture import LogCaptureForDecorator
 
 from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (
     get_gradable_blocks,
+    get_gradable_blocks_for_resource,
     send_problem_score_update,
     send_vertical_score_update,
 )
@@ -36,6 +37,50 @@ class TestGetGradableBlocks(TestCase):
 
         self.assertEqual(result, [problem, lti_tool, weighted_only])
         modulestore_mock().get_items.assert_called_once_with(course_key)
+
+
+class TestGetGradableBlocksForResource(TestCase):
+    """Test get_gradable_blocks_for_resource function."""
+
+    @patch(f'{MODULE_PATH}.modulestore')
+    def test_course_resource(self, modulestore_mock: MagicMock):
+        """A course resource returns all gradable blocks in the course."""
+        problem = MagicMock(has_score=True, graded=True, weight=None)
+        modulestore_mock().get_items.return_value = [problem]
+
+        result = get_gradable_blocks_for_resource('course-v1:Org+Course+Run')
+
+        self.assertEqual(result, [problem])
+
+    @patch(f'{MODULE_PATH}.modulestore')
+    def test_container_block_resource(self, modulestore_mock: MagicMock):
+        """A container block (unit) returns the gradable blocks inside it."""
+        problem1 = MagicMock(has_score=True, graded=True, weight=None)
+        problem1.get_children.return_value = []
+        problem2 = MagicMock(has_score=True, graded=False, weight=1.0)
+        problem2.get_children.return_value = []
+        unit = MagicMock()
+        unit.get_children.return_value = [problem1, problem2]
+        modulestore_mock().get_item.return_value = unit
+
+        result = get_gradable_blocks_for_resource(
+            'block-v1:Org+Course+Run+type@vertical+block@u1',
+        )
+
+        self.assertEqual(result, [problem1, problem2])
+
+    @patch(f'{MODULE_PATH}.modulestore')
+    def test_leaf_block_resource_returns_empty(self, modulestore_mock: MagicMock):
+        """A single leaf block returns [] — its own coupled lineitem already covers it."""
+        leaf = MagicMock()
+        leaf.get_children.return_value = []
+        modulestore_mock().get_item.return_value = leaf
+
+        result = get_gradable_blocks_for_resource(
+            'block-v1:Org+Course+Run+type@problem+block@p1',
+        )
+
+        self.assertEqual(result, [])
 
 
 class TestSendVerticalScoreUpdate(TestCase):
