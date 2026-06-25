@@ -147,12 +147,18 @@ class TestGetCourseBlockTree(TestCase):
 
         tree = get_course_block_tree('course-key', 'http://launch')
 
-        # chapter: container, not selectable
+        # root: the course itself, selectable (embeds the whole course)
         self.assertEqual(len(tree), 1)
-        self.assertEqual(tree[0]['category'], 'chapter')
-        self.assertFalse(tree[0]['selectable'])
+        course_node = tree[0]
+        self.assertEqual(course_node['category'], 'course')
+        self.assertTrue(course_node['selectable'])
+        self.assertEqual(course_node['custom'], {'resourceId': 'course-key'})
+        # chapter: container, not selectable
+        chapter_node = course_node['_children'][0]
+        self.assertEqual(chapter_node['category'], 'chapter')
+        self.assertFalse(chapter_node['selectable'])
         # unit: selectable, carries content-item fields
-        unit_node = tree[0]['_children'][0]
+        unit_node = chapter_node['_children'][0]
         self.assertTrue(unit_node['selectable'])
         self.assertEqual(unit_node['type'], 'ltiResourceLink')
         self.assertEqual(unit_node['url'], 'http://launch')

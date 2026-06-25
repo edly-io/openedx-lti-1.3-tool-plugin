@@ -623,10 +623,15 @@ class ResourceLinkLaunchView(LTIToolView):
 
         lineitems_url = ags_endpoint.get('lineitems', '')
         if lineitems_url and AGS_LINEITEM_SCOPE in ags_endpoint.get('scope', []):
+            # Per-problem lineitems apply to a course launch or a container-block launch
+            # (section/subsection/unit). Skip only when resource_id is not a valid key.
             try:
-                CourseKey.from_string(resource_id)  # only course launches need per-problem lineitems
+                CourseKey.from_string(resource_id)
             except InvalidKeyError:
-                return
+                try:
+                    UsageKey.from_string(resource_id)
+                except InvalidKeyError:
+                    return
             # Lazy import to avoid a circular import (tasks imports from this module's package).
             from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (  # pylint: disable=import-outside-toplevel
                 setup_problem_lineitems,

@@ -9,6 +9,7 @@ import logging
 from celery import shared_task
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from opaque_keys import InvalidKeyError
 from opaque_keys.edx.keys import CourseKey, UsageKey
 
 from openedx_lti_tool_plugin.edxapp_wrapper.grades_module import course_grade_factory
@@ -24,15 +25,20 @@ AGS_SCORE_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/score'
 AGS_LINEITEM_SCOPE = 'https://purl.imsglobal.org/spec/lti-ags/scope/lineitem'
 
 
+def is_gradable_block(block) -> bool:
+    """Return True if a block produces a score and is graded or weighted.
+
+    Covers native ``problem`` blocks, consumed LTI tools (``lti_consumer``) and any
+    other scored XBlock, so each becomes its own lineitem on the target platform.
+    """
+    return bool(
+        getattr(block, 'has_score', False)
+        and (getattr(block, 'graded', False) or getattr(block, 'weight', None))
+    )
+
+
 def get_gradable_blocks(course_key: CourseKey) -> list:
     """Return all gradable, scored blocks in the course.
-
-    A block is included when it produces a score (``has_score``) and either counts
-    toward the grade (``graded``) or carries a weight. This intentionally covers more
-    than native ``problem`` blocks: consumed LTI tools (``lti_consumer``) and any other
-    scored XBlock are included too, so each becomes its own lineitem on the target
-    platform. This is what lets Open edX act as a bridge, relaying grades from an
-    upstream LTI tool out to the downstream platform.
 
     Args:
         course_key: CourseKey of the launched course.
@@ -41,12 +47,45 @@ def get_gradable_blocks(course_key: CourseKey) -> list:
         List of gradable block instances.
 
     """
-    return [
-        block
-        for block in modulestore().get_items(course_key)
-        if getattr(block, 'has_score', False)
-        and (getattr(block, 'graded', False) or getattr(block, 'weight', None))
-    ]
+    return [block for block in modulestore().get_items(course_key) if is_gradable_block(block)]
+
+
+def get_gradable_blocks_for_resource(resource_id: str) -> list:
+    """Return the gradable blocks for a launched resource (course OR container block).
+
+    - Course launch → every gradable block in the course.
+    - Container block launch (section/subsection/unit) → the gradable blocks within it,
+      so embedding a unit creates one lineitem per problem inside that unit.
+    - Leaf block launch (a single problem) → empty list: its own coupled lineitem
+      (created in ``handle_ags``) already covers it, so we don't split it.
+
+    Args:
+        resource_id: Launched course or block ID.
+
+    Returns:
+        List of gradable block instances.
+
+    """
+    try:
+        return get_gradable_blocks(CourseKey.from_string(resource_id))
+    except InvalidKeyError:
+        pass
+
+    root = modulestore().get_item(UsageKey.from_string(resource_id))
+    if not root.get_children():
+        return []
+
+    gradable = []
+
+    def collect(block):
+        for child in block.get_children():
+            if is_gradable_block(child):
+                gradable.append(child)
+            collect(child)
+
+    collect(root)
+
+    return gradable
 
 
 @shared_task(name=f'{MODULE_PATH}.setup_problem_lineitems')
@@ -81,7 +120,7 @@ def setup_problem_lineitems(
     if not lti_profile:
         return
 
-    blocks = get_gradable_blocks(CourseKey.from_string(resource_id))
+    blocks = get_gradable_blocks_for_resource(resource_id)
 
     # JWT carrying the lineitems collection URL — mirrors publish_score_jwt.
     jwt = {
