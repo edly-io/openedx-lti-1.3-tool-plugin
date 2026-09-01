@@ -62,6 +62,18 @@ class LtiActivityLineitem(models.Model):
         help_text=_('Pre-created Moodle lineitem URL for this problem.'),
     )
     label = models.CharField(max_length=255, blank=True, default='')
+    criterion_key = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_(
+            'Identifies one internal AGS line item within `problem_id` (e.g. one Muzzy Lane '
+            'rubric criterion), sourced from that line item\'s own `resource_id`/`tag`. Empty '
+            'string means "the whole problem" — today\'s single-lineitem-per-problem semantics, '
+            'unchanged for every existing row and every block that never has more than one '
+            'internal line item.',
+        ),
+    )
 
     class Meta:
         """Model metadata options."""
@@ -69,7 +81,7 @@ class LtiActivityLineitem(models.Model):
         app_label = app_config.name
         verbose_name = 'LTI activity lineitem'
         verbose_name_plural = 'LTI activity lineitems'
-        unique_together = ['platform_id', 'resource_link_id', 'problem_id']
+        unique_together = ['platform_id', 'resource_link_id', 'problem_id', 'criterion_key']
 
     def __str__(self) -> str:
         """Model string representation."""
@@ -82,6 +94,12 @@ class LtiGradedResourceManager(models.Manager):
     def all_from_user_id(self, user_id: int, context_key: str) -> Optional[QuerySet]:
         """
         Retrieve all instances for a user ID and context key.
+
+        Deliberately not filtered by `criterion_key`: a block with per-criterion records has
+        several rows sharing one `context_key`, distinguished only by `criterion_key`. A caller
+        that wants just the coupled/collapsed record (`criterion_key=''`) must filter for that
+        explicitly — see `send_score_updates`, which does, precisely so it never republishes the
+        collapsed value onto a per-criterion record.
 
         Args:
             user_id: User ID.
@@ -115,6 +133,7 @@ class LtiGradedResource(models.Model):
         max_length=255,
         help_text=_('The opaque key string of the resource.'),
         validators=[validate_context_key],
+        db_index=True,
     )
     lineitem = models.URLField(
         max_length=255,
@@ -130,6 +149,53 @@ class LtiGradedResource(models.Model):
         blank=True,
         help_text=_('Score maximum of the last score successfully sent to the platform.'),
     )
+    criterion_key = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_(
+            'Identifies one internal AGS line item within `context_key` (e.g. one Muzzy Lane '
+            'rubric criterion). Empty string ("") is the coupled/collapsed record every launch '
+            'has always created — today\'s single-score semantics, unchanged. Deliberately has '
+            'no validator (unlike `context_key`): it is not itself a CourseKey/UsageKey, just an '
+            'opaque tag borrowed from the source line item, and adding one would be the wrong '
+            'kind of check for what this field actually holds.',
+        ),
+    )
+    resource_link_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_(
+            'LTI resource link id (the Moodle activity/placement) from the launch that created '
+            'this record. Captured here because it is only available on the launch request, '
+            'while a per-criterion relay runs later, asynchronously, off a score change — by '
+            'then the original launch request is long gone, so anything needed at relay time '
+            'that only the launch claims carry has to be stored, not recomputed.',
+        ),
+    )
+    lineitems_url = models.URLField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_(
+            'AGS `lineitems` collection URL from the launch claims — the endpoint used to '
+            'create additional per-criterion lineitems later. Same reasoning as '
+            '`resource_link_id`: only available at launch time, needed again later.',
+        ),
+    )
+    context_id = models.CharField(
+        max_length=255,
+        blank=True,
+        default='',
+        help_text=_(
+            'LTI context claim id (the Moodle course, as opposed to `resource_link_id`, the '
+            'specific activity within it) from the launch that created this record. Same '
+            'reasoning as `resource_link_id`/`lineitems_url`: only available at launch time, '
+            'needed again later — here, to fill in the informational (non-unique-key) '
+            '`LtiActivityLineitem.context_id` field when a per-criterion lineitem is created.',
+        ),
+    )
 
     class Meta:
         """Model metadata options."""
@@ -137,7 +203,7 @@ class LtiGradedResource(models.Model):
         app_label = app_config.name
         verbose_name = 'LTI graded resource'
         verbose_name_plural = 'LTI graded resources'
-        unique_together = ['lti_profile', 'context_key', 'lineitem']
+        unique_together = ['lti_profile', 'context_key', 'lineitem', 'criterion_key']
 
     def __str__(self) -> str:
         """Model string representation."""

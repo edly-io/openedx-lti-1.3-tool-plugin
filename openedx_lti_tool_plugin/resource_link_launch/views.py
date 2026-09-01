@@ -596,6 +596,12 @@ class ResourceLinkLaunchView(LTIToolView):
         only, per the tool configuration) it additionally fans out one lineitem per problem
         in the launched content.
 
+        Also stores `resource_link_id`, `lineitems_url` and `context_id` on that coupled record
+        even though this method never uses them itself. All three only exist on the launch
+        request, but a per-criterion relay (`ags.tasks.send_score_updates`) needs them later,
+        asynchronously, off a score change — long after this request has finished — so they have
+        to be saved here or nowhere.
+
         Args:
             message: DjangoMessageLaunch object.
             claims: Claims dictionary.
@@ -621,18 +627,35 @@ class ResourceLinkLaunchView(LTIToolView):
                 _(f'Missing required AGS scope: {AGS_SCORE_SCOPE}'),
             )
 
+        lineitems_url = ags_endpoint.get('lineitems', '')
+        resource_link_id = claims.get(RESOURCE_LINK_CLAIM, {}).get('id', '')
+        context_id = claims.get(CONTEXT_CLAIM, {}).get('id', '')
+
         # Coupled (per-placement) lineitem — used by every platform, the default mode.
+        # `criterion_key=''` is explicit (not just the field default) so this call reads
+        # unambiguously as "the coupled record", the same way every per-criterion create
+        # elsewhere passes its own non-empty criterion_key explicitly.
         try:
-            LtiGradedResource.objects.get_or_create(
+            graded_resource, created = LtiGradedResource.objects.get_or_create(
                 lti_profile=lti_profile,
                 context_key=resource_id,
                 lineitem=lineitem,
+                criterion_key='',
             )
         except ValidationError as exc:
             raise ResourceLinkException(_(exc.messages[0])) from exc
 
+        # Backfill on every launch, not just creation: a relaunch is the only chance to pick
+        # up a `lineitems_url`/`resource_link_id` that was empty on an older row (e.g. created
+        # before this fix existed), mirroring how `setup_problem_lineitems` backfills a missing
+        # `LtiActivityLineitem.lineitem` on relaunch instead of only at creation.
+        if created or not graded_resource.lineitems_url or not graded_resource.resource_link_id:
+            graded_resource.lineitems_url = lineitems_url
+            graded_resource.resource_link_id = resource_link_id
+            graded_resource.context_id = context_id
+            graded_resource.save(update_fields=['lineitems_url', 'resource_link_id', 'context_id'])
+
         # Per-problem fan-out (Moodle only). Coupled mode (Canvas/Blackboard) stops here.
-        lineitems_url = ags_endpoint.get('lineitems', '')
         if (
             lti_tool_configuration.uses_per_problem_passback()
             and lineitems_url

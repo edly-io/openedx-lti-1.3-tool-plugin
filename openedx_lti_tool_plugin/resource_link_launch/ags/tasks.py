@@ -5,6 +5,7 @@ Attributes:
 
 """
 import logging
+from typing import Optional
 
 from celery import shared_task
 from django.contrib.auth import get_user_model
@@ -14,7 +15,7 @@ from opaque_keys.edx.keys import CourseKey, UsageKey
 
 from openedx_lti_tool_plugin.edxapp_wrapper.grades_module import course_grade_factory
 from openedx_lti_tool_plugin.edxapp_wrapper.modulestore_module import modulestore
-from openedx_lti_tool_plugin.models import LtiProfile
+from openedx_lti_tool_plugin.models import LtiProfile, LtiToolConfiguration
 from openedx_lti_tool_plugin.resource_link_launch.ags import MODULE_PATH
 from openedx_lti_tool_plugin.resource_link_launch.ags.models import LtiActivityLineitem, LtiGradedResource
 
@@ -178,6 +179,240 @@ def setup_problem_lineitems(
             )
 
 
+def get_multi_line_item_lti_configuration(block, lti_profile: LtiProfile):
+    """Return this block's LtiConfiguration if it qualifies for per-criterion Moodle relay.
+
+    Three independent, unrelated conditions all have to hold, so none of them alone is a safe
+    signal on its own:
+
+    - The block is an ``lti_consumer`` block at all (native problems, ORA, etc. never qualify).
+    - Its own AGS mode is ``programmatic`` — an ``lti_consumer``-side setting meaning "the tool
+      (e.g. Muzzy Lane) manages its own AGS line items", which is a *precondition* for having
+      more than one, not by itself a request to relay them onward to Moodle.
+    - The Moodle-facing ``LtiToolConfiguration`` for *this launch* has opted into per-problem
+      passback (``uses_per_problem_passback()``) — the actual, deliberate "yes, fan these out"
+      decision. Reusing this existing flag (rather than adding a new one) means an operator who
+      wants ``programmatic`` mode for some other reason, with a ``coupled``-mode Moodle tool,
+      is correctly left untouched.
+
+    Args:
+        block: The loaded XBlock instance for a location in `send_score_updates`'s ancestor walk.
+        lti_profile: The launching user's LtiProfile.
+
+    Returns:
+        The block's `lti_consumer.models.LtiConfiguration` if it qualifies, else None.
+
+    """
+    if getattr(block, 'category', None) != 'lti_consumer':
+        return None
+
+    try:
+        # Lazy, guarded import: xblock-lti-consumer is a separate installable plugin, and this
+        # whole check is meaningless (and its models unavailable) on any Open edX instance that
+        # doesn't have it installed.
+        from lti_consumer.models import LtiConfiguration  # pylint: disable=import-outside-toplevel,import-error
+    except ImportError:
+        return None
+
+    lti_configuration = LtiConfiguration.objects.filter(location=block.location).first()
+    if not lti_configuration or lti_configuration.get_lti_advantage_ags_mode() != 'programmatic':
+        return None
+
+    from pylti1p3.contrib.django import DjangoDbToolConf  # pylint: disable=import-outside-toplevel
+    from pylti1p3.exception import LtiException  # pylint: disable=import-outside-toplevel
+
+    try:
+        # get_lti_tool raises LtiException (not just returning None) when iss/aud don't match
+        # any registration. That should never actually happen here — this profile already
+        # launched successfully through this exact iss/aud, or the coupled LtiGradedResource
+        # this function's caller already found wouldn't exist — but this runs inside a Celery
+        # task, not a request with an outer LtiException handler, so it's caught explicitly
+        # rather than left to crash the task.
+        lti_tool_configuration = LtiToolConfiguration.objects.get(
+            lti_tool=DjangoDbToolConf().get_lti_tool(lti_profile.platform_id, lti_profile.client_id),
+        )
+    except (LtiToolConfiguration.DoesNotExist, LtiException):
+        return None
+
+    if not lti_tool_configuration.uses_per_problem_passback():
+        return None
+
+    return lti_configuration
+
+
+def get_external_user_id(lti_profile: LtiProfile) -> Optional[str]:
+    """Return this profile's xblock-lti-consumer external user id, creating one if needed.
+
+    ``LtiAgsScore.user_id`` is Muzzy Lane's own opaque identifier for the learner (LTI's
+    "external user id"), not an Open edX user id — the two vocabularies never overlap, so
+    scores can't be looked up by `lti_profile.user_id` directly. Reuses
+    ``compat.batch_get_or_create_externalids`` (the same helper `xblock-lti-consumer` itself
+    uses for this, see `lti_consumer/plugin/views.py`'s `attach_external_user_ids`) rather than
+    querying `ExternalId` directly, so this doesn't depend on knowing that model's own field
+    names — get-or-create semantics mean this is safe to call even for a learner who has never
+    actually launched Muzzy Lane; the later `LtiAgsScore` lookup then simply finds nothing.
+
+    Args:
+        lti_profile: The launching user's LtiProfile.
+
+    Returns:
+        The external user id string, or None if xblock-lti-consumer isn't installed.
+
+    """
+    try:
+        from lti_consumer.plugin import compat as lti_consumer_compat  # pylint: disable=import-outside-toplevel,import-error
+    except ImportError:
+        return None
+
+    external_ids = lti_consumer_compat.batch_get_or_create_externalids([lti_profile.user])
+    external_id = external_ids.get(lti_profile.user.id)
+
+    return str(external_id.external_user_id) if external_id else None
+
+
+def relay_criterion_scores(
+    lti_profile: LtiProfile,
+    coupled_resource: LtiGradedResource,
+    lti_configuration,
+    block,
+):
+    """Publish each of this block's AGS line-item scores to its own Moodle column.
+
+    Reads directly from `LtiAgsScore` — a plain, synchronous row per (line item, user); that
+    model's own `unique_together` guarantees at most one — rather than through
+    `course_grade_factory`, which is Open edX's cached/aggregated grade view. That distinction
+    matters: it means a later-running call here can never see an *older* value than an earlier
+    one already published, which is the most plausible explanation for the original bug's
+    non-determinism (identical inputs producing different outcomes across runs) — reading
+    through a cache that hadn't caught up, not merely "last write wins".
+
+    Called once per criterion save, and republishes *every* currently-known criterion for the
+    block each time, not just the one that changed, because the native signal that triggers this
+    doesn't carry per-criterion identity. A burst of N criteria posted close together therefore
+    produces up to N redundant re-publishes of already-settled values — harmless, not racy:
+    `LtiGradedResource.publish_score`'s own `last_score_given` check skips re-sending a value
+    that hasn't changed, so the only cost is a few wasted lookups.
+
+    No due-date or `FullyGraded` check happens here: both are already guaranteed by the fact
+    that this only ever runs after `xblock-lti-consumer`'s own `publish_grade_on_score_update`
+    succeeded (see `send_score_updates`, which is this function's only caller).
+
+    Args:
+        lti_profile: The launching user's LtiProfile.
+        coupled_resource: This block's coupled (`criterion_key=''`) LtiGradedResource — the
+            source of `lineitems_url`, captured at launch since this call happens well after
+            the launch request that carried it has ended.
+        lti_configuration: This block's `lti_consumer.models.LtiConfiguration`.
+        block: The loaded XBlock instance, for its `display_name` (labeling only).
+
+    """
+    from lti_consumer.models import LtiAgsScore  # pylint: disable=import-outside-toplevel,import-error
+
+    external_user_id = get_external_user_id(lti_profile)
+    if not external_user_id:
+        return
+
+    scores = LtiAgsScore.objects.filter(
+        line_item__lti_configuration=lti_configuration,
+        user_id=external_user_id,
+        grading_progress=LtiAgsScore.FULLY_GRADED,
+        score_given__isnull=False,
+        score_maximum__gt=0,
+    ).select_related('line_item')
+    if not scores:
+        return
+
+    from pylti1p3.contrib.django import DjangoDbToolConf, DjangoMessageLaunch  # pylint: disable=import-outside-toplevel
+    from pylti1p3.lineitem import LineItem  # pylint: disable=import-outside-toplevel
+
+    # JWT carrying the lineitems collection URL — mirrors setup_problem_lineitems, which
+    # creates the analogous per-problem (rather than per-criterion) lineitems.
+    jwt = {
+        'body': {
+            'iss': lti_profile.platform_id,
+            'aud': lti_profile.client_id,
+            AGS_CLAIM_ENDPOINT: {
+                'lineitems': coupled_resource.lineitems_url,
+                'scope': {AGS_LINEITEM_SCOPE, AGS_SCORE_SCOPE},
+            },
+        },
+    }
+    ags = DjangoMessageLaunch(request=None, tool_config=DjangoDbToolConf())\
+        .set_auto_validation(enable=False)\
+        .set_jwt(jwt)\
+        .set_restored()\
+        .validate_registration()\
+        .get_ags()
+
+    block_id = str(lti_configuration.location)
+    # Same fallback as setup_problem_lineitems' own per-problem labels.
+    block_label = block.display_name or block_id
+
+    for score in scores:
+        line_item = score.line_item
+        # Muzzy Lane's own identifier for this specific criterion — resource_id is the primary
+        # source; tag is a fallback for a line item created without one set.
+        criterion_key = line_item.resource_id or line_item.tag
+        if not criterion_key:
+            continue
+        criterion_label = line_item.label or criterion_key
+
+        activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
+            platform_id=lti_profile.platform_id,
+            resource_link_id=coupled_resource.resource_link_id,
+            problem_id=block_id,
+            criterion_key=criterion_key,
+            defaults={
+                'context_id': coupled_resource.context_id,
+                'resource_id': block_id,
+                'label': f'{block_label} — {criterion_label}',
+            },
+        )
+
+        if created or not activity_lineitem.lineitem:
+            lineitem = LineItem()
+            # Tag per (activity, problem, criterion) — same shape as setup_problem_lineitems'
+            # own tag, with the criterion appended so distinct criteria never share a lineitem.
+            resource_link_id = coupled_resource.resource_link_id
+            tag_prefix = f'{resource_link_id}:{block_id}' if resource_link_id else block_id
+            lineitem.set_tag(f'{tag_prefix}:{criterion_key}')
+            lineitem.set_label(f'{block_label} — {criterion_label}')
+            # Normalized to percent (max 100), not the source line item's own score_maximum:
+            # Muzzy Lane's own possible-points can vary per learner (branching/looping), so only
+            # a percentage is safe to compare and post consistently across attempts.
+            lineitem.set_score_maximum(100.0)
+            activity_lineitem.lineitem = ags.find_or_create_lineitem(lineitem, find_by='tag').get_id()
+            activity_lineitem.save()
+
+        try:
+            graded_resource, _created = LtiGradedResource.objects.get_or_create(
+                lti_profile=lti_profile,
+                context_key=block_id,
+                lineitem=activity_lineitem.lineitem,
+                criterion_key=criterion_key,
+            )
+        except ValidationError as exc:
+            log.warning(
+                'LTI AGS: skipping per-criterion LtiGradedResource for block %s criterion %s: %s',
+                block_id,
+                criterion_key,
+                exc.messages,
+            )
+            continue
+
+        # Cap at score_maximum (AGS allows a tool to send a score higher than its own declared
+        # maximum) and convert to a percent — same capping `xblock-lti-consumer`'s own
+        # `publish_grade_on_score_update` applies before writing into Open edX's gradebook.
+        percent = min(score.score_given, score.score_maximum) / score.score_maximum * 100
+        log.info(
+            'LTI AGS: Sending per-criterion AGS update for %s criterion %s with user %s',
+            block_id,
+            criterion_key,
+            lti_profile.user_id,
+        )
+        graded_resource.publish_score(percent, 100.0)
+
+
 @shared_task(name=f'{MODULE_PATH}.send_score_updates')
 def send_score_updates(
     user_id: str,
@@ -189,12 +424,22 @@ def send_score_updates(
     A grade change in Open edX is only ``(user, block)`` — it carries no notion of which
     platform activity the learner launched. So on each change we walk the changed block
     and its ancestors (unit, subsection, section) up to — but not including — the course,
-    and for every level that has an ``LtiGradedResource`` for this user we post that
-    level's aggregate score to its lineitem. This serves both:
+    and for every level that has a coupled ``LtiGradedResource`` for this user we post that
+    level's score to its lineitem. This serves both:
 
     - **coupled** records (context = a launched unit/subsection/component) -> the launched
       resource's aggregate lands in its single per-placement column, and
     - **per-problem** records (context = a leaf block) -> the block's own score.
+
+    For a block that qualifies for per-criterion relay (see
+    ``get_multi_line_item_lti_configuration``), the coupled record is *not* published to at
+    all — ``relay_criterion_scores`` owns that block's Moodle relay instead, publishing one
+    column per internal AGS line item rather than one collapsed column. Every lookup here is
+    explicitly filtered to ``criterion_key=''`` (the coupled record) for exactly this reason:
+    ``LtiGradedResourceManager.all_from_user_id`` is not criterion_key-aware, so without this
+    filter this loop would also find and overwrite every per-criterion record for a block with
+    the block's single collapsed score — a defensive backstop, not the only thing preventing
+    that; the primary guarantee is that a block only ever goes down one branch below, never both.
 
     The course level is handled separately by ``publish_course_score``.
 
@@ -222,24 +467,33 @@ def send_score_updates(
         modulestore().get_course(CourseKey.from_string(course_id)),
     )
 
-    # Collect the changed block and its ancestors, up to (not including) the course.
+    # Collect the changed block and its ancestors, up to (not including) the course. Blocks are
+    # kept alongside their locations (not just re-fetched later) so the per-criterion check below
+    # doesn't need a second modulestore lookup for every location.
     locations = []
     block = modulestore().get_item(usage_key)
     while block is not None and block.location.block_type != 'course':
-        locations.append(block.location)
+        locations.append((block.location, block))
         parent = getattr(block, 'parent', None)
         block = modulestore().get_item(parent) if parent else None
 
-    for location in locations:
-        graded_resources = LtiGradedResource.objects.all_from_user_id(
+    for location, location_block in locations:
+        # criterion_key='' is explicit, not incidental: see this function's own docstring.
+        coupled_resources = LtiGradedResource.objects.all_from_user_id(
             user_id=user_id,
             context_key=str(location),
-        )
-        if not graded_resources:
+        ).filter(criterion_key='')
+        if not coupled_resources:
+            continue
+
+        lti_configuration = get_multi_line_item_lti_configuration(location_block, lti_profile)
+
+        if lti_configuration:
+            relay_criterion_scores(lti_profile, coupled_resources[0], lti_configuration, location_block)
             continue
 
         earned, possible = course_grade.score_for_block(location)
-        for graded_resource in graded_resources:
+        for graded_resource in coupled_resources:
             log.info(
                 'LTI AGS: Sending AGS update for %s with user %s',
                 str(location),
