@@ -1,6 +1,7 @@
 """Django Models."""
 from __future__ import annotations
 
+import hashlib
 import logging
 import math
 from datetime import datetime, timezone
@@ -20,6 +21,31 @@ from openedx_lti_tool_plugin.models import LtiProfile
 from openedx_lti_tool_plugin.resource_link_launch.ags.validators import validate_context_key
 
 log = logging.getLogger(__name__)
+
+
+def compute_unique_key(*parts: str) -> str:
+    """Return a fixed-length (64-char) digest of a composite natural key.
+
+    Both models below need a `criterion_key` dimension added to a key that already spans
+    3-4 CharField(255)/URLField(255) columns. MySQL/InnoDB limits a composite index to 3072
+    bytes total; at utf8mb4 (4 bytes/char, plus a length-prefix byte per variable-length
+    column) three such columns alone already use ~3060-3066 of that budget — there is no
+    room left for a fourth, at any length, without this. A joined-with-a-separator hash of
+    the real columns sidesteps the limit entirely while keeping the natural columns
+    themselves as plain, queryable data (lookups still filter on the real fields; only the
+    DB-level uniqueness constraint is on this derived one). `\x1f` (ASCII unit separator) is
+    used as the join separator specifically because it practically never appears in any of
+    the real values (issuer URLs, opaque keys, tags), avoiding ambiguous concatenations like
+    "ab"+"c" vs "a"+"bc".
+
+    Args:
+        *parts: The natural key's component values, in a fixed, caller-defined order.
+
+    Returns:
+        A 64-character hex SHA-256 digest.
+
+    """
+    return hashlib.sha256('\x1f'.join(str(part) for part in parts).encode()).hexdigest()
 
 
 class LtiActivityLineitem(models.Model):
@@ -74,6 +100,18 @@ class LtiActivityLineitem(models.Model):
             'internal line item.',
         ),
     )
+    unique_key = models.CharField(
+        max_length=64,
+        unique=True,
+        editable=False,
+        default='',
+        help_text=_(
+            'SHA-256 digest of (platform_id, resource_link_id, problem_id, criterion_key), '
+            'auto-computed in save(). This — not those four columns directly — is what '
+            'enforces uniqueness; see compute_unique_key() for why. Lookups still filter on '
+            'the real columns; only the DB-level constraint moved to this field.',
+        ),
+    )
 
     class Meta:
         """Model metadata options."""
@@ -81,11 +119,27 @@ class LtiActivityLineitem(models.Model):
         app_label = app_config.name
         verbose_name = 'LTI activity lineitem'
         verbose_name_plural = 'LTI activity lineitems'
-        unique_together = ['platform_id', 'resource_link_id', 'problem_id', 'criterion_key']
 
     def __str__(self) -> str:
         """Model string representation."""
         return f'<LtiActivityLineitem, ID: {self.id}>'
+
+    def save(self, *args: tuple, **kwargs: dict):
+        """Model save method.
+
+        Computes `unique_key` from the natural key fields before every save, so callers
+        (`get_or_create`, direct `.save()`, admin edits) never need to compute or pass it
+        themselves — it can't drift out of sync with the fields it's derived from.
+
+        Args:
+            *args: Variable length argument list.
+            **kwargs: Arbitrary keyword arguments.
+
+        """
+        self.unique_key = compute_unique_key(
+            self.platform_id, self.resource_link_id, self.problem_id, self.criterion_key,
+        )
+        super().save(*args, **kwargs)
 
 
 class LtiGradedResourceManager(models.Manager):
@@ -196,6 +250,18 @@ class LtiGradedResource(models.Model):
             '`LtiActivityLineitem.context_id` field when a per-criterion lineitem is created.',
         ),
     )
+    unique_key = models.CharField(
+        max_length=64,
+        unique=True,
+        editable=False,
+        default='',
+        help_text=_(
+            'SHA-256 digest of (lti_profile_id, context_key, lineitem, criterion_key), '
+            'auto-computed in save(). This — not those four columns directly — is what '
+            'enforces uniqueness; see compute_unique_key() for why. Lookups still filter on '
+            'the real columns; only the DB-level constraint moved to this field.',
+        ),
+    )
 
     class Meta:
         """Model metadata options."""
@@ -203,7 +269,6 @@ class LtiGradedResource(models.Model):
         app_label = app_config.name
         verbose_name = 'LTI graded resource'
         verbose_name_plural = 'LTI graded resources'
-        unique_together = ['lti_profile', 'context_key', 'lineitem', 'criterion_key']
 
     def __str__(self) -> str:
         """Model string representation."""
@@ -212,13 +277,18 @@ class LtiGradedResource(models.Model):
     def save(self, *args: tuple, **kwargs: dict):
         """Model save method.
 
-        In this method we run field validators.
+        Computes `unique_key` before validating/saving, so `full_clean`'s own uniqueness
+        check runs against the field that actually enforces it, and so callers never need to
+        compute or pass it themselves.
 
         Args:
             *args: Variable length argument list.
             **kwargs: Arbitrary keyword arguments.
 
         """
+        self.unique_key = compute_unique_key(
+            self.lti_profile_id, self.context_key, self.lineitem, self.criterion_key,
+        )
         self.full_clean()
         super().save(*args, **kwargs)
 

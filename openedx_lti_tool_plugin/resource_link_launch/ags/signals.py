@@ -67,10 +67,13 @@ def publish_course_score(
         log.info(f'LtiProfile not found for user: {log_extra}')
         return
 
+    # criterion_key='' per all_from_user_id's own contract: a course-level context_key can't
+    # actually collide with a block-level one holding per-criterion records today, but filtering
+    # explicitly keeps this caller correct on that contract rather than correct by coincidence.
     lti_graded_resources = LtiGradedResource.objects.all_from_user_id(
         user_id=user.id,
         context_key=course_key,
-    )
+    ).filter(criterion_key='')
     log.info(f'Sending course LTI AGS score publish request(s): {log_extra}')
 
     for lti_graded_resource in lti_graded_resources:

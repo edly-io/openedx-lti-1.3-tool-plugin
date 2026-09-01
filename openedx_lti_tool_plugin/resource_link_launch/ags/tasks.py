@@ -89,6 +89,44 @@ def get_gradable_blocks_for_resource(resource_id: str) -> list:
     return gradable
 
 
+def get_ags_for_lineitems_url(iss: str, aud: str, lineitems_url: str):
+    """Build a pylti1p3 AGS service object scoped to a `lineitems` collection URL.
+
+    Shared by `setup_problem_lineitems` and `relay_criterion_scores` — both need to call
+    Moodle's `find_or_create_lineitem`, and the only thing that differs between them is
+    which `lineitems_url` they're pointed at; the JWT-rebuilding dance around it (mirroring
+    `LtiGradedResource.publish_score_jwt`, since there's no live launch request here to
+    reuse) is identical either way.
+
+    Args:
+        iss: LTI platform issuer.
+        aud: LTI platform audience (client id).
+        lineitems_url: AGS lineitems collection URL.
+
+    Returns:
+        A pylti1p3 AGS service object with `find_or_create_lineitem`.
+
+    """
+    from pylti1p3.contrib.django import DjangoDbToolConf, DjangoMessageLaunch  # pylint: disable=import-outside-toplevel
+
+    jwt = {
+        'body': {
+            'iss': iss,
+            'aud': aud,
+            AGS_CLAIM_ENDPOINT: {
+                'lineitems': lineitems_url,
+                'scope': {AGS_LINEITEM_SCOPE, AGS_SCORE_SCOPE},
+            },
+        },
+    }
+    return DjangoMessageLaunch(request=None, tool_config=DjangoDbToolConf())\
+        .set_auto_validation(enable=False)\
+        .set_jwt(jwt)\
+        .set_restored()\
+        .validate_registration()\
+        .get_ags()
+
+
 @shared_task(name=f'{MODULE_PATH}.setup_problem_lineitems')
 def setup_problem_lineitems(
     lti_profile_id: int,
@@ -107,8 +145,6 @@ def setup_problem_lineitems(
 
     The lineitem is keyed and tagged by ``resource_link_id`` so that two platform
     activities embedding the same Open edX problem get separate columns instead of one.
-    The AGS message is rebuilt from a JWT carrying the ``lineitems`` collection URL,
-    mirroring ``LtiGradedResource.publish_score``.
 
     Args:
         lti_profile_id: ID of the launching user's LtiProfile.
@@ -118,7 +154,6 @@ def setup_problem_lineitems(
         lineitems_url: AGS lineitems collection URL from the launch JWT.
 
     """
-    from pylti1p3.contrib.django import DjangoDbToolConf, DjangoMessageLaunch  # pylint: disable=import-outside-toplevel
     from pylti1p3.lineitem import LineItem  # pylint: disable=import-outside-toplevel
 
     lti_profile = LtiProfile.objects.filter(id=lti_profile_id).first()
@@ -126,24 +161,7 @@ def setup_problem_lineitems(
         return
 
     blocks = get_gradable_blocks_for_resource(resource_id)
-
-    # JWT carrying the lineitems collection URL — mirrors publish_score_jwt.
-    jwt = {
-        'body': {
-            'iss': lti_profile.platform_id,
-            'aud': lti_profile.client_id,
-            AGS_CLAIM_ENDPOINT: {
-                'lineitems': lineitems_url,
-                'scope': {AGS_LINEITEM_SCOPE, AGS_SCORE_SCOPE},
-            },
-        },
-    }
-    ags = DjangoMessageLaunch(request=None, tool_config=DjangoDbToolConf())\
-        .set_auto_validation(enable=False)\
-        .set_jwt(jwt)\
-        .set_restored()\
-        .validate_registration()\
-        .get_ags()
+    ags = get_ags_for_lineitems_url(lti_profile.platform_id, lti_profile.client_id, lineitems_url)
 
     for block in blocks:
         block_id = str(block.location)
@@ -322,31 +340,24 @@ def relay_criterion_scores(
     if not scores:
         return
 
-    from pylti1p3.contrib.django import DjangoDbToolConf, DjangoMessageLaunch  # pylint: disable=import-outside-toplevel
     from pylti1p3.lineitem import LineItem  # pylint: disable=import-outside-toplevel
 
-    # JWT carrying the lineitems collection URL — mirrors setup_problem_lineitems, which
-    # creates the analogous per-problem (rather than per-criterion) lineitems.
-    jwt = {
-        'body': {
-            'iss': lti_profile.platform_id,
-            'aud': lti_profile.client_id,
-            AGS_CLAIM_ENDPOINT: {
-                'lineitems': coupled_resource.lineitems_url,
-                'scope': {AGS_LINEITEM_SCOPE, AGS_SCORE_SCOPE},
-            },
-        },
-    }
-    ags = DjangoMessageLaunch(request=None, tool_config=DjangoDbToolConf())\
-        .set_auto_validation(enable=False)\
-        .set_jwt(jwt)\
-        .set_restored()\
-        .validate_registration()\
-        .get_ags()
+    ags = get_ags_for_lineitems_url(
+        lti_profile.platform_id, lti_profile.client_id, coupled_resource.lineitems_url,
+    )
 
     block_id = str(lti_configuration.location)
     # Same fallback as setup_problem_lineitems' own per-problem labels.
     block_label = block.display_name or block_id
+    # LtiActivityLineitem is shared across every user of the same placement (see its own
+    # docstring), so this has to identify the placement itself, not this one user's launch.
+    # resource_link_id is the natural choice, but it's a field this fix introduced — existing
+    # LtiGradedResource rows only get it backfilled on relaunch (see handle_ags), so it can
+    # still be '' here for a user who hasn't relaunched since this shipped. Falling back to
+    # coupled_resource.lineitem avoids two different placements of the same block colliding
+    # onto one shared lineitem during that window: lineitem has existed, and been distinct per
+    # placement, since the coupled record was first created — long before resource_link_id did.
+    placement_key = coupled_resource.resource_link_id or coupled_resource.lineitem
 
     for score in scores:
         line_item = score.line_item
@@ -359,23 +370,23 @@ def relay_criterion_scores(
 
         activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
             platform_id=lti_profile.platform_id,
-            resource_link_id=coupled_resource.resource_link_id,
+            resource_link_id=placement_key,
             problem_id=block_id,
             criterion_key=criterion_key,
             defaults={
                 'context_id': coupled_resource.context_id,
-                'resource_id': block_id,
+                # The launched Open edX resource, matching setup_problem_lineitems' own use of
+                # this field — not block_id (that's what problem_id already holds).
+                'resource_id': coupled_resource.context_key,
                 'label': f'{block_label} — {criterion_label}',
             },
         )
 
         if created or not activity_lineitem.lineitem:
             lineitem = LineItem()
-            # Tag per (activity, problem, criterion) — same shape as setup_problem_lineitems'
+            # Tag per (placement, problem, criterion) — same shape as setup_problem_lineitems'
             # own tag, with the criterion appended so distinct criteria never share a lineitem.
-            resource_link_id = coupled_resource.resource_link_id
-            tag_prefix = f'{resource_link_id}:{block_id}' if resource_link_id else block_id
-            lineitem.set_tag(f'{tag_prefix}:{criterion_key}')
+            lineitem.set_tag(f'{placement_key}:{block_id}:{criterion_key}')
             lineitem.set_label(f'{block_label} — {criterion_label}')
             # Normalized to percent (max 100), not the source line item's own score_maximum:
             # Muzzy Lane's own possible-points can vary per learner (branching/looping), so only
@@ -489,7 +500,14 @@ def send_score_updates(
         lti_configuration = get_multi_line_item_lti_configuration(location_block, lti_profile)
 
         if lti_configuration:
-            relay_criterion_scores(lti_profile, coupled_resources[0], lti_configuration, location_block)
+            # One relay per coupled resource, not just the first: the same block can be
+            # embedded via more than one Moodle placement (LtiActivityLineitem's own
+            # docstring — "distinct activities... in separate gradebook columns instead of
+            # collapsing into one"), each with its own coupled record and its own
+            # lineitems_url. Picking only coupled_resources[0] would silently relay one
+            # placement and drop every other one.
+            for coupled_resource in coupled_resources:
+                relay_criterion_scores(lti_profile, coupled_resource, lti_configuration, location_block)
             continue
 
         earned, possible = course_grade.score_for_block(location)

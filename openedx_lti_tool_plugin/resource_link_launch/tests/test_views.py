@@ -1015,6 +1015,8 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
                 'scope': [AGS_SCORE_SCOPE],
             },
         }
+        graded_resource = MagicMock()
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, True)
 
         self.view_class.handle_ags(
             launch_message,
@@ -1028,6 +1030,14 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
             lti_profile=LTI_PROFILE,
             context_key=COURSE_ID,
             lineitem='random-lineitem',
+            criterion_key='',
+        )
+        # created=True → the launch-only fields (lineitems_url/resource_link_id/context_id,
+        # all '' here since this launch_data carries neither claim) get backfilled onto the
+        # coupled record regardless, since a per-criterion relay needs them later and this
+        # request is the only chance to capture them.
+        graded_resource.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
         )
 
     @patch(f'{MODULE_PATH}._')
@@ -1062,6 +1072,7 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
             lti_profile=LTI_PROFILE,
             context_key=COURSE_ID,
             lineitem='random-lineitem',
+            criterion_key='',
         )
         gettext_mock.assert_called_once_with(val_error.messages[0])
 

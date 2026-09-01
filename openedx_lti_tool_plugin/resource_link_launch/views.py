@@ -653,7 +653,14 @@ class ResourceLinkLaunchView(LTIToolView):
             graded_resource.lineitems_url = lineitems_url
             graded_resource.resource_link_id = resource_link_id
             graded_resource.context_id = context_id
-            graded_resource.save(update_fields=['lineitems_url', 'resource_link_id', 'context_id'])
+            try:
+                # LtiGradedResource.save() unconditionally runs full_clean(), and
+                # lineitems_url is a validated URLField — guarded the same as the
+                # get_or_create three lines up, so a malformed claim from any platform
+                # (not just Muzzy Lane) can't turn into an unhandled 500 mid-launch.
+                graded_resource.save(update_fields=['lineitems_url', 'resource_link_id', 'context_id'])
+            except ValidationError as exc:
+                raise ResourceLinkException(_(exc.messages[0])) from exc
 
         # Per-problem fan-out (Moodle only). Coupled mode (Canvas/Blackboard) stops here.
         if (

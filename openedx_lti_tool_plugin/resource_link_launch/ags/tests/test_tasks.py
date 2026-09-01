@@ -190,6 +190,42 @@ class TestSendScoreUpdates(TestCase):
         self.course_grade.score_for_block.assert_not_called()
         self.graded_resource.publish_score.assert_not_called()
 
+    def test_relays_every_placement_for_a_multi_placement_block(
+        self,
+        lti_profile_mock: MagicMock,
+        usage_key_mock: MagicMock,  # pylint: disable=unused-argument
+        get_user_model_mock: MagicMock,
+        modulestore_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        course_key_mock: MagicMock,  # pylint: disable=unused-argument
+        course_grade_factory_mock: MagicMock,
+        get_multi_line_item_lti_configuration_mock: MagicMock,
+        relay_criterion_scores_mock: MagicMock,
+    ):
+        """Two Moodle placements embedding the same block both get relayed, not just one.
+
+        Regression test: an earlier version of this code picked only coupled_resources[0],
+        silently dropping every placement past the first whenever the same Muzzy-Lane block
+        was embedded via more than one Moodle activity.
+        """
+        lti_profile = MagicMock()
+        lti_profile_mock.objects.filter.return_value.first.return_value = lti_profile
+        get_user_model_mock.return_value.objects.filter.return_value.first.return_value = self.user
+        course_grade_factory_mock.return_value.read.return_value = self.course_grade
+        lti_configuration = MagicMock()
+        get_multi_line_item_lti_configuration_mock.return_value = lti_configuration
+        leaf, course_block = self._leaf_then_course()
+        modulestore_mock.return_value.get_item.side_effect = [leaf, course_block]
+        second_graded_resource = MagicMock()
+        all_from_user_id_result = lti_graded_resource_mock.objects.all_from_user_id.return_value
+        all_from_user_id_result.filter.return_value = [self.graded_resource, second_graded_resource]
+
+        self.assertIsNone(send_score_updates(self.user_id, self.course_id, self.problem_id))
+
+        self.assertEqual(relay_criterion_scores_mock.call_count, 2)
+        relay_criterion_scores_mock.assert_any_call(lti_profile, self.graded_resource, lti_configuration, leaf)
+        relay_criterion_scores_mock.assert_any_call(lti_profile, second_graded_resource, lti_configuration, leaf)
+
     def test_skips_location_with_no_coupled_resource(
         self,
         lti_profile_mock: MagicMock,
