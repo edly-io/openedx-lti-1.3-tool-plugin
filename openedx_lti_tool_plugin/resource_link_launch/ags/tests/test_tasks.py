@@ -1,6 +1,7 @@
 """Tests tasks module."""
 from unittest.mock import MagicMock, patch
 
+from django.core.exceptions import ValidationError
 from django.test import TestCase
 from pylti1p3.exception import LtiException
 
@@ -10,6 +11,7 @@ from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (
     get_gradable_blocks_for_resource,
     get_multi_line_item_lti_configuration,
     send_score_updates,
+    setup_problem_lineitems,
 )
 from openedx_lti_tool_plugin.resource_link_launch.ags.tests import MODULE_PATH
 from openedx_lti_tool_plugin.tests import COURSE_ID, USAGE_KEY
@@ -81,6 +83,147 @@ class TestGetGradableBlocksForResource(TestCase):
         )
 
         self.assertEqual(result, [])
+
+
+@patch(f'{MODULE_PATH}.get_ags_for_lineitems_url')
+@patch(f'{MODULE_PATH}.get_gradable_blocks_for_resource')
+@patch(f'{MODULE_PATH}.LtiGradedResource')
+@patch(f'{MODULE_PATH}.LtiActivityLineitem')
+@patch(f'{MODULE_PATH}.LtiProfile')
+class TestSetupProblemLineitems(TestCase):
+    """Test setup_problem_lineitems task.
+
+    A container launch (course/section/subsection/unit) reaches this task instead of
+    handle_ags's own coupled-record path — so this task has to do its own
+    resource_link_id/lineitems_url/context_id capture-and-backfill too, mirroring
+    handle_ags, or a block only ever reached this way keeps lineitems_url='' forever and
+    crashes relay_criterion_scores on its first real grade (see get_ags_for_lineitems_url's
+    docstring and relay_criterion_scores' own use of coupled_resource.lineitems_url).
+    """
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.lti_profile_id = 1
+        self.resource_id = 'block-v1:Org+Course+Run+type@vertical+block@u1'
+        self.context_id = 'random-context-id'
+        self.resource_link_id = 'random-resource-link-id'
+        self.lineitems_url = 'https://platform.example/lineitems'
+        self.block = MagicMock(display_name='Problem 1')
+        self.block.location = 'block-v1:Org+Course+Run+type@problem+block@p1'
+
+    def test_backfills_launch_only_fields_on_new_graded_resource(
+        self,
+        lti_profile_mock: MagicMock,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_gradable_blocks_for_resource_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """A newly created per-problem LtiGradedResource gets the launch-only fields set."""
+        get_gradable_blocks_for_resource_mock.return_value = [self.block]
+        activity_lineitem = MagicMock(lineitem='existing-lineitem')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        graded_resource = MagicMock(lineitems_url='', resource_link_id='')
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, True)
+
+        setup_problem_lineitems(
+            self.lti_profile_id,
+            self.resource_id,
+            self.context_id,
+            self.resource_link_id,
+            self.lineitems_url,
+        )
+
+        lti_graded_resource_mock.objects.get_or_create.assert_called_once_with(
+            lti_profile=lti_profile_mock.objects.filter.return_value.first.return_value,
+            context_key=str(self.block.location),
+            lineitem=activity_lineitem.lineitem,
+            criterion_key='',
+        )
+        self.assertEqual(graded_resource.lineitems_url, self.lineitems_url)
+        self.assertEqual(graded_resource.resource_link_id, self.resource_link_id)
+        self.assertEqual(graded_resource.context_id, self.context_id)
+        graded_resource.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
+        )
+
+    def test_backfills_existing_graded_resource_missing_lineitems_url(
+        self,
+        lti_profile_mock: MagicMock,  # pylint: disable=unused-argument
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_gradable_blocks_for_resource_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """An older row (created before this fix existed) is backfilled on relaunch too."""
+        get_gradable_blocks_for_resource_mock.return_value = [self.block]
+        activity_lineitem = MagicMock(lineitem='existing-lineitem')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        graded_resource = MagicMock(lineitems_url='', resource_link_id='random-resource-link-id')
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, False)
+
+        setup_problem_lineitems(
+            self.lti_profile_id,
+            self.resource_id,
+            self.context_id,
+            self.resource_link_id,
+            self.lineitems_url,
+        )
+
+        self.assertEqual(graded_resource.lineitems_url, self.lineitems_url)
+        graded_resource.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
+        )
+
+    def test_skips_backfill_when_already_captured(
+        self,
+        lti_profile_mock: MagicMock,  # pylint: disable=unused-argument
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_gradable_blocks_for_resource_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """A row that already has both fields set isn't re-saved every relaunch."""
+        get_gradable_blocks_for_resource_mock.return_value = [self.block]
+        activity_lineitem = MagicMock(lineitem='existing-lineitem')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        graded_resource = MagicMock(
+            lineitems_url='https://platform.example/lineitems',
+            resource_link_id='random-resource-link-id',
+        )
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, False)
+
+        setup_problem_lineitems(
+            self.lti_profile_id,
+            self.resource_id,
+            self.context_id,
+            self.resource_link_id,
+            self.lineitems_url,
+        )
+
+        graded_resource.save.assert_not_called()
+
+    def test_with_lti_graded_resource_get_or_create_validation_error(
+        self,
+        lti_profile_mock: MagicMock,  # pylint: disable=unused-argument
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_gradable_blocks_for_resource_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """A ValidationError on LtiGradedResource creation skips the backfill, doesn't crash."""
+        get_gradable_blocks_for_resource_mock.return_value = [self.block]
+        activity_lineitem = MagicMock(lineitem='existing-lineitem')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        lti_graded_resource_mock.objects.get_or_create.side_effect = ValidationError(None, None)
+
+        self.assertIsNone(setup_problem_lineitems(
+            self.lti_profile_id,
+            self.resource_id,
+            self.context_id,
+            self.resource_link_id,
+            self.lineitems_url,
+        ))
 
 
 @patch(f'{MODULE_PATH}.relay_criterion_scores')

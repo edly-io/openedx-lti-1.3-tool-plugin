@@ -183,11 +183,16 @@ def setup_problem_lineitems(
             activity_lineitem.lineitem = ags.find_or_create_lineitem(lineitem, find_by='tag').get_id()
             activity_lineitem.save()
 
+        # criterion_key='' is explicit: this is the coupled (per-problem) record for this
+        # block, the same role handle_ags's own coupled record plays for a leaf launch — and
+        # if this block later turns out to qualify for per-criterion relay (get_multi_line_item_
+        # lti_configuration), this is the row relay_criterion_scores reads lineitems_url from.
         try:
-            LtiGradedResource.objects.get_or_create(
+            graded_resource, resource_created = LtiGradedResource.objects.get_or_create(
                 lti_profile=lti_profile,
                 context_key=block_id,
                 lineitem=activity_lineitem.lineitem,
+                criterion_key='',
             )
         except ValidationError as exc:
             log.warning(
@@ -195,6 +200,28 @@ def setup_problem_lineitems(
                 block_id,
                 exc.messages,
             )
+            continue
+
+        # Same capture-and-backfill as handle_ags's own coupled record, and for the same
+        # reason: resource_link_id/lineitems_url/context_id only exist on the launch request
+        # (this function's own arguments, here — there's no live request to re-read them from
+        # later), but a per-criterion relay needs lineitems_url long after this task has
+        # finished. Without this, a block reached only through a container launch (never
+        # through handle_ags's own leaf-launch path) would keep lineitems_url='' forever, and
+        # its first real grade would crash relay_criterion_scores with an HTTP call against an
+        # empty URL.
+        if resource_created or not graded_resource.lineitems_url or not graded_resource.resource_link_id:
+            graded_resource.lineitems_url = lineitems_url
+            graded_resource.resource_link_id = resource_link_id
+            graded_resource.context_id = context_id
+            try:
+                graded_resource.save(update_fields=['lineitems_url', 'resource_link_id', 'context_id'])
+            except ValidationError as exc:
+                log.warning(
+                    'LTI AGS: skipping lineitems_url backfill for block %s: %s',
+                    block_id,
+                    exc.messages,
+                )
 
 
 def get_multi_line_item_lti_configuration(block, lti_profile: LtiProfile):
