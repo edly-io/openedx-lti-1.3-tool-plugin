@@ -57,7 +57,7 @@ class TestPublishCourseScore(TestCase):
             self.user.openedx_lti_tool_plugin_lti_profile,
             self.course_grade.percent,
         ]
-        all_from_user_id_mock.return_value = [self.lti_graded_resource]
+        all_from_user_id_mock.return_value.filter.return_value = [self.lti_graded_resource]
 
         publish_course_score(None, self.user, self.course_grade, self.course_key)
 
@@ -72,6 +72,7 @@ class TestPublishCourseScore(TestCase):
             user_id=self.user.id,
             context_key=self.course_key,
         )
+        all_from_user_id_mock.return_value.filter.assert_called_once_with(criterion_key='')
         self.lti_graded_resource.publish_score.assert_called_once_with(
             self.course_grade.percent,
             MAX_SCORE,

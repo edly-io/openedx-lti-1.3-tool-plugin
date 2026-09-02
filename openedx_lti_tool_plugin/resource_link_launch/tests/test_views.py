@@ -1015,6 +1015,8 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
                 'scope': [AGS_SCORE_SCOPE],
             },
         }
+        graded_resource = MagicMock()
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, True)
 
         self.view_class.handle_ags(
             launch_message,
@@ -1028,15 +1030,23 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
             lti_profile=LTI_PROFILE,
             context_key=COURSE_ID,
             lineitem='random-lineitem',
+            criterion_key='',
+        )
+        # created=True → the launch-only fields (lineitems_url/resource_link_id/context_id,
+        # all '' here since this launch_data carries neither claim) get backfilled onto the
+        # coupled record regardless, since a per-criterion relay needs them later and this
+        # request is the only chance to capture them.
+        graded_resource.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
         )
 
     @patch(f'{MODULE_PATH}._')
-    def test_with_lti_graded_resource_get_or_create_validation_error(
+    def test_with_lti_graded_resource_get_or_create_validation_error_no_matching_row(
         self,
         gettext_mock: MagicMock,
         lti_graded_resource_mock: MagicMock,
     ):
-        """Test with ValidationError in LtiGradedResource.get_or_create."""
+        """A ValidationError with no matching row on retry means a real error: raise."""
         val_error = ValidationError(None, None)
         launch_message = MagicMock()
         launch_message.has_ags.return_value = True
@@ -1047,6 +1057,7 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
             },
         }
         lti_graded_resource_mock.objects.get_or_create.side_effect = val_error
+        lti_graded_resource_mock.objects.filter.return_value.first.return_value = None
 
         with self.assertRaises(ResourceLinkException):
             self.view_class.handle_ags(
@@ -1062,8 +1073,89 @@ class TestResourceLinkLaunchViewHandleAgs(ResourceLinkLaunchViewBaseTestCase):
             lti_profile=LTI_PROFILE,
             context_key=COURSE_ID,
             lineitem='random-lineitem',
+            criterion_key='',
         )
         gettext_mock.assert_called_once_with(val_error.messages[0])
+
+    def test_with_lti_graded_resource_get_or_create_validation_error_concurrent_row_found(
+        self,
+        lti_graded_resource_mock: MagicMock,
+    ):
+        """Regression test for M7: a concurrent launch's row is recovered via a re-fetch.
+
+        Django's own get_or_create only retries on IntegrityError, not on the ValidationError
+        LtiGradedResource.save() raises from full_clean()'s validate_unique — so a race between
+        two near-simultaneous launches for the same user+resource (e.g. a double-click, or two
+        tabs) would otherwise fail a launch that should have succeeded.
+        """
+        launch_message = MagicMock()
+        launch_message.has_ags.return_value = True
+        launch_data = {
+            AGS_CLAIM_ENDPOINT: {
+                'lineitem': 'random-lineitem',
+                'scope': [AGS_SCORE_SCOPE],
+            },
+        }
+        lti_graded_resource_mock.objects.get_or_create.side_effect = ValidationError(None, None)
+        concurrent_row = MagicMock(lineitems_url='', resource_link_id='')
+        lti_graded_resource_mock.objects.filter.return_value.first.return_value = concurrent_row
+
+        self.view_class.handle_ags(
+            launch_message,
+            launch_data,
+            LTI_PROFILE,
+            COURSE_ID,
+            MagicMock(),
+        )
+
+        lti_graded_resource_mock.objects.filter.assert_called_once_with(
+            lti_profile=LTI_PROFILE,
+            context_key=COURSE_ID,
+            lineitem='random-lineitem',
+            criterion_key='',
+        )
+        concurrent_row.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
+        )
+
+    @patch(f'{MODULE_PATH}._')
+    def test_with_backfill_save_validation_error_does_not_abort_the_launch(
+        self,
+        gettext_mock: MagicMock,  # pylint: disable=unused-argument
+        lti_graded_resource_mock: MagicMock,
+    ):
+        """Regression test for M4: a malformed launch-only field must not 400 the whole launch.
+
+        These three fields (lineitems_url/resource_link_id/context_id) are best-effort metadata
+        for a per-criterion relay that may never even apply to this block. Before this fix, any
+        platform sending an oversized or malformed claim here — not just Muzzy Lane — would turn
+        an otherwise-successful launch into a ResourceLinkException, even though the `lineitem`
+        claim that actually matters for AGS was already validated and accepted above.
+        """
+        launch_message = MagicMock()
+        launch_message.has_ags.return_value = True
+        launch_data = {
+            AGS_CLAIM_ENDPOINT: {
+                'lineitem': 'random-lineitem',
+                'scope': [AGS_SCORE_SCOPE],
+            },
+        }
+        graded_resource = MagicMock()
+        graded_resource.save.side_effect = ValidationError(None, None)
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, True)
+
+        # Must not raise.
+        self.view_class.handle_ags(
+            launch_message,
+            launch_data,
+            LTI_PROFILE,
+            COURSE_ID,
+            MagicMock(),
+        )
+
+        graded_resource.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
+        )
 
     def test_without_ags_claims(self, lti_graded_resource_mock: MagicMock):
         """Test without AGS claims."""

@@ -596,6 +596,12 @@ class ResourceLinkLaunchView(LTIToolView):
         only, per the tool configuration) it additionally fans out one lineitem per problem
         in the launched content.
 
+        Also stores `resource_link_id`, `lineitems_url` and `context_id` on that coupled record
+        even though this method never uses them itself. All three only exist on the launch
+        request, but a per-criterion relay (`ags.tasks.send_score_updates`) needs them later,
+        asynchronously, off a score change — long after this request has finished — so they have
+        to be saved here or nowhere.
+
         Args:
             message: DjangoMessageLaunch object.
             claims: Claims dictionary.
@@ -621,18 +627,66 @@ class ResourceLinkLaunchView(LTIToolView):
                 _(f'Missing required AGS scope: {AGS_SCORE_SCOPE}'),
             )
 
+        lineitems_url = ags_endpoint.get('lineitems', '')
+        resource_link_id = claims.get(RESOURCE_LINK_CLAIM, {}).get('id', '')
+        context_id = claims.get(CONTEXT_CLAIM, {}).get('id', '')
+
         # Coupled (per-placement) lineitem — used by every platform, the default mode.
+        # `criterion_key=''` is explicit (not just the field default) so this call reads
+        # unambiguously as "the coupled record", the same way every per-criterion create
+        # elsewhere passes its own non-empty criterion_key explicitly.
         try:
-            LtiGradedResource.objects.get_or_create(
+            graded_resource, created = LtiGradedResource.objects.get_or_create(
                 lti_profile=lti_profile,
                 context_key=resource_id,
                 lineitem=lineitem,
+                criterion_key='',
             )
         except ValidationError as exc:
-            raise ResourceLinkException(_(exc.messages[0])) from exc
+            # A concurrent launch for the same user+resource (e.g. a double-click, or two tabs)
+            # can win the insert between this get() and our own — full_clean()'s validate_unique
+            # then raises ValidationError here, unlike a plain IntegrityError, which is the only
+            # thing get_or_create itself retries on. Re-fetch by the same natural key: if this
+            # was that race, the other launch's row is there now, and this one can proceed
+            # against it instead of failing a launch that would otherwise have succeeded. If not
+            # found, the error was real (e.g. a malformed lineitem claim) and there is nothing to
+            # recover — the launch must fail.
+            graded_resource = LtiGradedResource.objects.filter(
+                lti_profile=lti_profile,
+                context_key=resource_id,
+                lineitem=lineitem,
+                criterion_key='',
+            ).first()
+            if graded_resource is None:
+                raise ResourceLinkException(_(exc.messages[0])) from exc
+            created = False
+
+        # Backfill on every launch, not just creation: a relaunch is the only chance to pick
+        # up a `lineitems_url`/`resource_link_id` that was empty on an older row (e.g. created
+        # before this fix existed), mirroring how `setup_problem_lineitems` backfills a missing
+        # `LtiActivityLineitem.lineitem` on relaunch instead of only at creation.
+        if created or not graded_resource.lineitems_url or not graded_resource.resource_link_id:
+            graded_resource.lineitems_url = lineitems_url
+            graded_resource.resource_link_id = resource_link_id
+            graded_resource.context_id = context_id
+            try:
+                graded_resource.save(update_fields=['lineitems_url', 'resource_link_id', 'context_id'])
+            except ValidationError as exc:
+                # Unlike the `lineitem` claim validated above (required for AGS to work at
+                # all), these three fields are best-effort metadata for a per-criterion relay
+                # that may never even apply to this block — log and continue rather than fail
+                # the whole launch over them. This runs for every platform on every launch
+                # (Canvas, Blackboard, declarative-mode Moodle included), so raising here would
+                # turn one malformed claim from any platform into a launch failure for a feature
+                # that platform isn't even using. Mirrors setup_problem_lineitems' own handling
+                # of this same backfill.
+                log.warning(
+                    'LTI AGS: skipping launch-field backfill for %s: %s',
+                    resource_id,
+                    exc.messages,
+                )
 
         # Per-problem fan-out (Moodle only). Coupled mode (Canvas/Blackboard) stops here.
-        lineitems_url = ags_endpoint.get('lineitems', '')
         if (
             lti_tool_configuration.uses_per_problem_passback()
             and lineitems_url
