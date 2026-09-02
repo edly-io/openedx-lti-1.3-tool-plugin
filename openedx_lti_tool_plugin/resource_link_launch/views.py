@@ -643,7 +643,23 @@ class ResourceLinkLaunchView(LTIToolView):
                 criterion_key='',
             )
         except ValidationError as exc:
-            raise ResourceLinkException(_(exc.messages[0])) from exc
+            # A concurrent launch for the same user+resource (e.g. a double-click, or two tabs)
+            # can win the insert between this get() and our own — full_clean()'s validate_unique
+            # then raises ValidationError here, unlike a plain IntegrityError, which is the only
+            # thing get_or_create itself retries on. Re-fetch by the same natural key: if this
+            # was that race, the other launch's row is there now, and this one can proceed
+            # against it instead of failing a launch that would otherwise have succeeded. If not
+            # found, the error was real (e.g. a malformed lineitem claim) and there is nothing to
+            # recover — the launch must fail.
+            graded_resource = LtiGradedResource.objects.filter(
+                lti_profile=lti_profile,
+                context_key=resource_id,
+                lineitem=lineitem,
+                criterion_key='',
+            ).first()
+            if graded_resource is None:
+                raise ResourceLinkException(_(exc.messages[0])) from exc
+            created = False
 
         # Backfill on every launch, not just creation: a relaunch is the only chance to pick
         # up a `lineitems_url`/`resource_link_id` that was empty on an older row (e.g. created
@@ -654,13 +670,21 @@ class ResourceLinkLaunchView(LTIToolView):
             graded_resource.resource_link_id = resource_link_id
             graded_resource.context_id = context_id
             try:
-                # LtiGradedResource.save() unconditionally runs full_clean(), and
-                # lineitems_url is a validated URLField — guarded the same as the
-                # get_or_create three lines up, so a malformed claim from any platform
-                # (not just Muzzy Lane) can't turn into an unhandled 500 mid-launch.
                 graded_resource.save(update_fields=['lineitems_url', 'resource_link_id', 'context_id'])
             except ValidationError as exc:
-                raise ResourceLinkException(_(exc.messages[0])) from exc
+                # Unlike the `lineitem` claim validated above (required for AGS to work at
+                # all), these three fields are best-effort metadata for a per-criterion relay
+                # that may never even apply to this block — log and continue rather than fail
+                # the whole launch over them. This runs for every platform on every launch
+                # (Canvas, Blackboard, declarative-mode Moodle included), so raising here would
+                # turn one malformed claim from any platform into a launch failure for a feature
+                # that platform isn't even using. Mirrors setup_problem_lineitems' own handling
+                # of this same backfill.
+                log.warning(
+                    'LTI AGS: skipping launch-field backfill for %s: %s',
+                    resource_id,
+                    exc.messages,
+                )
 
         # Per-problem fan-out (Moodle only). Coupled mode (Canvas/Blackboard) stops here.
         if (

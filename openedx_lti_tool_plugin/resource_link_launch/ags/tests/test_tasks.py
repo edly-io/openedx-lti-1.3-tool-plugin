@@ -10,6 +10,7 @@ from openedx_lti_tool_plugin.resource_link_launch.ags.tasks import (
     get_gradable_blocks,
     get_gradable_blocks_for_resource,
     get_multi_line_item_lti_configuration,
+    relay_criterion_scores,
     send_score_updates,
     setup_problem_lineitems,
 )
@@ -203,7 +204,50 @@ class TestSetupProblemLineitems(TestCase):
 
         graded_resource.save.assert_not_called()
 
-    def test_with_lti_graded_resource_get_or_create_validation_error(
+    def test_activity_lineitem_lookup_is_scoped_to_the_coupled_row(
+        self,
+        lti_profile_mock: MagicMock,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_gradable_blocks_for_resource_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """The LtiActivityLineitem lookup must include criterion_key='', not just problem_id.
+
+        Regression test: without criterion_key='' in the lookup, a relaunch of a block that has
+        already accrued per-criterion LtiActivityLineitem rows (from relay_criterion_scores)
+        would match all of them too, and get_or_create's own get() would raise
+        MultipleObjectsReturned — aborting this loop for every remaining gradable block in the
+        launch, not just this one.
+        """
+        get_gradable_blocks_for_resource_mock.return_value = [self.block]
+        activity_lineitem = MagicMock(lineitem='existing-lineitem')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        lti_graded_resource_mock.objects.get_or_create.return_value = (
+            MagicMock(lineitems_url=self.lineitems_url, resource_link_id=self.resource_link_id), False,
+        )
+
+        setup_problem_lineitems(
+            self.lti_profile_id,
+            self.resource_id,
+            self.context_id,
+            self.resource_link_id,
+            self.lineitems_url,
+        )
+
+        lti_activity_lineitem_mock.objects.get_or_create.assert_called_once_with(
+            platform_id=lti_profile_mock.objects.filter.return_value.first.return_value.platform_id,
+            resource_link_id=self.resource_link_id,
+            problem_id=str(self.block.location),
+            criterion_key='',
+            defaults={
+                'context_id': self.context_id,
+                'resource_id': self.resource_id,
+                'label': self.block.display_name,
+            },
+        )
+
+    def test_with_lti_graded_resource_get_or_create_validation_error_no_matching_row(
         self,
         lti_profile_mock: MagicMock,  # pylint: disable=unused-argument
         lti_activity_lineitem_mock: MagicMock,
@@ -211,11 +255,12 @@ class TestSetupProblemLineitems(TestCase):
         get_gradable_blocks_for_resource_mock: MagicMock,
         get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
     ):
-        """A ValidationError on LtiGradedResource creation skips the backfill, doesn't crash."""
+        """A ValidationError with no matching row on retry means a real error: skip, don't crash."""
         get_gradable_blocks_for_resource_mock.return_value = [self.block]
         activity_lineitem = MagicMock(lineitem='existing-lineitem')
         lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
         lti_graded_resource_mock.objects.get_or_create.side_effect = ValidationError(None, None)
+        lti_graded_resource_mock.objects.filter.return_value.first.return_value = None
 
         self.assertIsNone(setup_problem_lineitems(
             self.lti_profile_id,
@@ -224,6 +269,42 @@ class TestSetupProblemLineitems(TestCase):
             self.resource_link_id,
             self.lineitems_url,
         ))
+
+    def test_with_lti_graded_resource_get_or_create_validation_error_concurrent_row_found(
+        self,
+        lti_profile_mock: MagicMock,  # pylint: disable=unused-argument
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_gradable_blocks_for_resource_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """A ValidationError caused by a concurrent creator is recovered via a re-fetch.
+
+        Regression test for the same class of bug as H2/M7: Django's own get_or_create only
+        retries on IntegrityError, not on the ValidationError LtiGradedResource.save() raises
+        from full_clean()'s validate_unique. Without the re-fetch, a launch racing another
+        launch (or another setup_problem_lineitems run) for the same user+block would drop this
+        block's launch-field backfill instead of recovering the row the other call just created.
+        """
+        get_gradable_blocks_for_resource_mock.return_value = [self.block]
+        activity_lineitem = MagicMock(lineitem='existing-lineitem')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        lti_graded_resource_mock.objects.get_or_create.side_effect = ValidationError(None, None)
+        concurrent_row = MagicMock(lineitems_url='', resource_link_id='')
+        lti_graded_resource_mock.objects.filter.return_value.first.return_value = concurrent_row
+
+        setup_problem_lineitems(
+            self.lti_profile_id,
+            self.resource_id,
+            self.context_id,
+            self.resource_link_id,
+            self.lineitems_url,
+        )
+
+        self.assertEqual(concurrent_row.lineitems_url, self.lineitems_url)
+        concurrent_row.save.assert_called_once_with(
+            update_fields=['lineitems_url', 'resource_link_id', 'context_id'],
+        )
 
 
 @patch(f'{MODULE_PATH}.relay_criterion_scores')
@@ -523,6 +604,12 @@ class TestGetMultiLineItemLtiConfiguration(TestCase):
         lti_configuration.get_lti_advantage_ags_mode.return_value = 'programmatic'
         lti_consumer_models = MagicMock()
         lti_consumer_models.LtiConfiguration.objects.filter.return_value.first.return_value = lti_configuration
+        # Without this, LtiToolConfiguration.DoesNotExist (LtiToolConfiguration itself being a
+        # MagicMock here) is an auto-generated MagicMock attribute, not an exception class, and
+        # the `except (LtiToolConfiguration.DoesNotExist, LtiException):` in the code under test
+        # raises TypeError before it ever gets to catch the LtiException this test is for. Same
+        # fix as the sibling test_no_matching_lti_tool_configuration_returns_none above.
+        lti_tool_configuration_mock.DoesNotExist = Exception
         django_db_tool_conf_mock.return_value.get_lti_tool.side_effect = LtiException('no registration')
 
         with patch.dict('sys.modules', {'lti_consumer.models': lti_consumer_models}):
@@ -571,17 +658,24 @@ class TestGetExternalUserId(TestCase):
 
         `from lti_consumer.plugin import compat` needs every level of that dotted path
         resolvable, not just the leaf — unlike a plain `from lti_consumer.models import X`,
-        where only the leaf module needs to be in `sys.modules`. Verified empirically before
-        writing this: stubbing only the leaf here reliably raises ImportError instead of
-        reaching the code under test, silently turning this into a no-op test.
+        where only the leaf module needs to be in `sys.modules`. Registering the submodule in
+        `sys.modules` alone is not enough: `from package import submodule` resolves via
+        `getattr(package, 'submodule')` first, and a bare `MagicMock()` for the parent
+        auto-generates an unrelated `.compat` attribute on that lookup instead of raising
+        AttributeError (which is the only thing that would make Python fall back to
+        `sys.modules['lti_consumer.plugin.compat']`). So the parent mock's `.compat` has to be
+        set explicitly to the same object registered as the submodule, or this silently resolves
+        to a different mock than the one the assertions below check.
         """
         external_id = MagicMock(external_user_id='ext-123')
         compat_mock = MagicMock()
         compat_mock.batch_get_or_create_externalids.return_value = {42: external_id}
+        plugin_mock = MagicMock()
+        plugin_mock.compat = compat_mock
 
         with patch.dict('sys.modules', {
             'lti_consumer': MagicMock(),
-            'lti_consumer.plugin': MagicMock(),
+            'lti_consumer.plugin': plugin_mock,
             'lti_consumer.plugin.compat': compat_mock,
         }):
             result = get_external_user_id(self.lti_profile)
@@ -593,12 +687,255 @@ class TestGetExternalUserId(TestCase):
         """The batch lookup not returning an entry for this user is a clean no-op."""
         compat_mock = MagicMock()
         compat_mock.batch_get_or_create_externalids.return_value = {}
+        plugin_mock = MagicMock()
+        plugin_mock.compat = compat_mock
 
         with patch.dict('sys.modules', {
             'lti_consumer': MagicMock(),
-            'lti_consumer.plugin': MagicMock(),
+            'lti_consumer.plugin': plugin_mock,
             'lti_consumer.plugin.compat': compat_mock,
         }):
             result = get_external_user_id(self.lti_profile)
 
         self.assertIsNone(result)
+
+
+@patch(f'{MODULE_PATH}.get_ags_for_lineitems_url')
+@patch(f'{MODULE_PATH}.get_external_user_id')
+@patch(f'{MODULE_PATH}.LtiGradedResource')
+@patch(f'{MODULE_PATH}.LtiActivityLineitem')
+class TestRelayCriterionScores(TestCase):
+    """Test relay_criterion_scores function.
+
+    Previously untested entirely (only ever @patch'ed out in TestSendScoreUpdates) — added
+    alongside the H2/M7/M9 fixes below so the new guard, retry, and error-isolation logic is
+    actually exercised, not just read.
+    """
+
+    def setUp(self):
+        """Set up test fixtures."""
+        self.lti_profile = MagicMock(platform_id='https://platform.example', client_id='client-1', user_id=7)
+        self.coupled_resource = MagicMock(
+            lineitems_url='https://platform.example/lineitems',
+            resource_link_id='rlid-1',
+            lineitem='https://platform.example/li/coupled',
+            context_id='ctx-1',
+            context_key='block-v1:Org+Course+Run+type@vertical+block@u1',
+        )
+        self.lti_configuration = MagicMock(location='block-v1:Org+Course+Run+type@lti_consumer+block@b1')
+        self.block = MagicMock(display_name='Rubric Block')
+
+    def _mock_lti_consumer_models(self, scores: list) -> MagicMock:
+        """Return a `lti_consumer.models` stub whose LtiAgsScore query returns `scores`."""
+        lti_consumer_models = MagicMock()
+        lti_consumer_models.LtiAgsScore.objects.filter.return_value.select_related.return_value = scores
+        return lti_consumer_models
+
+    def test_no_external_user_id_returns_none(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,  # pylint: disable=unused-argument
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """No external_user_id (learner never launched Muzzy Lane) is a clean no-op."""
+        get_external_user_id_mock.return_value = None
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([])}):
+            result = relay_criterion_scores(
+                self.lti_profile, self.coupled_resource, self.lti_configuration, self.block,
+            )
+
+        self.assertIsNone(result)
+        lti_activity_lineitem_mock.objects.get_or_create.assert_not_called()
+
+    def test_no_qualifying_scores_returns_none(
+        self,
+        lti_activity_lineitem_mock: MagicMock,  # pylint: disable=unused-argument
+        lti_graded_resource_mock: MagicMock,  # pylint: disable=unused-argument
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,
+    ):
+        """No FullyGraded/scored line items for this user+block is a clean no-op."""
+        get_external_user_id_mock.return_value = 'ext-1'
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([])}):
+            result = relay_criterion_scores(
+                self.lti_profile, self.coupled_resource, self.lti_configuration, self.block,
+            )
+
+        self.assertIsNone(result)
+        get_ags_for_lineitems_url_mock.assert_not_called()
+
+    def test_skips_relay_when_lineitems_url_not_captured(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,  # pylint: disable=unused-argument
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,
+    ):
+        """No lineitems_url yet (rollout window, or a coupled-only placement) is a clean no-op.
+
+        Regression test for H2: without this guard, get_ags_for_lineitems_url below builds a
+        JWT around an empty URL; pylti1p3 finds nothing and falls through to a lineitem-create
+        POST against that same empty URL — a MissingSchema failure that would abort this entire
+        send_score_updates run, not just this relay.
+        """
+        get_external_user_id_mock.return_value = 'ext-1'
+        self.coupled_resource.lineitems_url = ''
+        score = MagicMock()
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([score])}):
+            result = relay_criterion_scores(
+                self.lti_profile, self.coupled_resource, self.lti_configuration, self.block,
+            )
+
+        self.assertIsNone(result)
+        get_ags_for_lineitems_url_mock.assert_not_called()
+        lti_activity_lineitem_mock.objects.get_or_create.assert_not_called()
+
+    def test_publishes_score_for_a_single_criterion(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """The normal case: one criterion, converted to a percent, published to its own record."""
+        get_external_user_id_mock.return_value = 'ext-1'
+        line_item = MagicMock(resource_id='crit-1', tag='', label='Criterion 1')
+        score = MagicMock(line_item=line_item, score_given=8, score_maximum=10)
+        activity_lineitem = MagicMock(lineitem='https://platform.example/li/crit1')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        graded_resource = MagicMock()
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource, True)
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([score])}):
+            relay_criterion_scores(self.lti_profile, self.coupled_resource, self.lti_configuration, self.block)
+
+        lti_graded_resource_mock.objects.get_or_create.assert_called_once_with(
+            lti_profile=self.lti_profile,
+            context_key=str(self.lti_configuration.location),
+            lineitem=activity_lineitem.lineitem,
+            criterion_key='crit-1',
+        )
+        graded_resource.publish_score.assert_called_once_with(80.0, 100.0)
+
+    def test_one_criterion_publish_failure_does_not_stop_the_rest(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """Regression test for M9: one criterion's LtiException must not abort the others.
+
+        Before this fix, publish_score's own re-raise of LtiException/RequestException would
+        escape this loop entirely, taking out every remaining criterion for this block, every
+        remaining placement for this block, and every remaining ancestor level in
+        send_score_updates's own walk.
+        """
+        get_external_user_id_mock.return_value = 'ext-1'
+        line_item_1 = MagicMock(resource_id='crit-1', tag='', label='Criterion 1')
+        line_item_2 = MagicMock(resource_id='crit-2', tag='', label='Criterion 2')
+        score_1 = MagicMock(line_item=line_item_1, score_given=5, score_maximum=10)
+        score_2 = MagicMock(line_item=line_item_2, score_given=9, score_maximum=10)
+        activity_lineitem = MagicMock(lineitem='https://platform.example/li/shared')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        graded_resource_1 = MagicMock()
+        graded_resource_1.publish_score.side_effect = LtiException('moodle rejected it')
+        graded_resource_2 = MagicMock()
+        lti_graded_resource_mock.objects.get_or_create.side_effect = [
+            (graded_resource_1, True),
+            (graded_resource_2, True),
+        ]
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([score_1, score_2])}):
+            relay_criterion_scores(self.lti_profile, self.coupled_resource, self.lti_configuration, self.block)
+
+        graded_resource_1.publish_score.assert_called_once()
+        graded_resource_2.publish_score.assert_called_once_with(90.0, 100.0)
+
+    def test_validation_error_on_graded_resource_recovers_via_refetch(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """Regression test for M7: a concurrent relay's row is recovered via a re-fetch.
+
+        Django's own get_or_create only retries on IntegrityError, not on the ValidationError
+        LtiGradedResource.save() raises from full_clean()'s validate_unique — so a race between
+        two relays for the same user+block+criterion would otherwise drop this criterion's score
+        for this run instead of publishing to the row the other relay just committed.
+        """
+        get_external_user_id_mock.return_value = 'ext-1'
+        line_item = MagicMock(resource_id='crit-1', tag='', label='Criterion 1')
+        score = MagicMock(line_item=line_item, score_given=4, score_maximum=10)
+        activity_lineitem = MagicMock(lineitem='https://platform.example/li/crit1')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        lti_graded_resource_mock.objects.get_or_create.side_effect = ValidationError(None, None)
+        concurrent_row = MagicMock()
+        lti_graded_resource_mock.objects.filter.return_value.first.return_value = concurrent_row
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([score])}):
+            relay_criterion_scores(self.lti_profile, self.coupled_resource, self.lti_configuration, self.block)
+
+        concurrent_row.publish_score.assert_called_once_with(40.0, 100.0)
+
+    def test_validation_error_on_graded_resource_with_no_matching_row_skips_criterion(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,  # pylint: disable=unused-argument
+    ):
+        """A ValidationError with no matching row on retry means a real error: skip, don't crash."""
+        get_external_user_id_mock.return_value = 'ext-1'
+        line_item = MagicMock(resource_id='crit-1', tag='', label='Criterion 1')
+        score = MagicMock(line_item=line_item, score_given=4, score_maximum=10)
+        activity_lineitem = MagicMock(lineitem='https://platform.example/li/crit1')
+        lti_activity_lineitem_mock.objects.get_or_create.return_value = (activity_lineitem, False)
+        lti_graded_resource_mock.objects.get_or_create.side_effect = ValidationError(None, None)
+        lti_graded_resource_mock.objects.filter.return_value.first.return_value = None
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([score])}):
+            result = relay_criterion_scores(
+                self.lti_profile, self.coupled_resource, self.lti_configuration, self.block,
+            )
+
+        self.assertIsNone(result)
+
+    def test_lti_exception_creating_lineitem_does_not_stop_the_rest(
+        self,
+        lti_activity_lineitem_mock: MagicMock,
+        lti_graded_resource_mock: MagicMock,
+        get_external_user_id_mock: MagicMock,
+        get_ags_for_lineitems_url_mock: MagicMock,
+    ):
+        """An LtiException from find_or_create_lineitem is isolated the same as a publish failure."""
+        get_external_user_id_mock.return_value = 'ext-1'
+        line_item_1 = MagicMock(resource_id='crit-1', tag='', label='Criterion 1')
+        line_item_2 = MagicMock(resource_id='crit-2', tag='', label='Criterion 2')
+        score_1 = MagicMock(line_item=line_item_1, score_given=5, score_maximum=10)
+        score_2 = MagicMock(line_item=line_item_2, score_given=9, score_maximum=10)
+        # No lineitem yet for either — both must go through find_or_create_lineitem.
+        activity_lineitem_1 = MagicMock(lineitem='')
+        activity_lineitem_2 = MagicMock(lineitem='')
+        lti_activity_lineitem_mock.objects.get_or_create.side_effect = [
+            (activity_lineitem_1, True),
+            (activity_lineitem_2, True),
+        ]
+        get_ags_for_lineitems_url_mock.return_value.find_or_create_lineitem.side_effect = [
+            LtiException('missing lineitem scope'),
+            MagicMock(get_id=MagicMock(return_value='https://platform.example/li/crit2')),
+        ]
+        graded_resource_2 = MagicMock()
+        lti_graded_resource_mock.objects.get_or_create.return_value = (graded_resource_2, True)
+
+        with patch.dict('sys.modules', {'lti_consumer.models': self._mock_lti_consumer_models([score_1, score_2])}):
+            relay_criterion_scores(self.lti_profile, self.coupled_resource, self.lti_configuration, self.block)
+
+        activity_lineitem_1.save.assert_not_called()
+        graded_resource_2.publish_score.assert_called_once_with(90.0, 100.0)

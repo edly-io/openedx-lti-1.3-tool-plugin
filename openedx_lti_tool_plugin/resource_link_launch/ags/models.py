@@ -24,7 +24,7 @@ log = logging.getLogger(__name__)
 
 
 def compute_unique_key(*parts: str) -> str:
-    """Return a fixed-length (64-char) digest of a composite natural key.
+    r"""Return a fixed-length (64-char) digest of a composite natural key.
 
     Both models below need a `criterion_key` dimension added to a key that already spans
     3-4 CharField(255)/URLField(255) columns. MySQL/InnoDB limits a composite index to 3072

@@ -167,10 +167,17 @@ def setup_problem_lineitems(
         block_id = str(block.location)
         label = block.display_name or block_id
 
+        # criterion_key='' is required in the lookup, not just implied by the model default:
+        # relay_criterion_scores creates sibling rows for this same (platform_id,
+        # resource_link_id, problem_id) with a non-empty criterion_key once this block starts
+        # getting per-criterion relay. Without this filter, a relaunch after that point would
+        # match every one of those rows too, and get_or_create's own .get() would raise
+        # MultipleObjectsReturned — aborting this loop for every remaining gradable block.
         activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
             platform_id=lti_profile.platform_id,
             resource_link_id=resource_link_id,
             problem_id=block_id,
+            criterion_key='',
             defaults={'context_id': context_id, 'resource_id': resource_id, 'label': label},
         )
 
@@ -195,12 +202,26 @@ def setup_problem_lineitems(
                 criterion_key='',
             )
         except ValidationError as exc:
-            log.warning(
-                'LTI AGS: skipping LtiGradedResource for block %s: %s',
-                block_id,
-                exc.messages,
-            )
-            continue
+            # A concurrent call for the same user+block (e.g. two near-simultaneous launches)
+            # can win the insert between this get() and our own — full_clean()'s validate_unique
+            # then raises ValidationError here, unlike a plain IntegrityError, which is the only
+            # thing get_or_create itself retries on. Re-fetch by the same natural key: if this
+            # was that race, the other call's row is there now. If not (a genuinely malformed
+            # value), nothing is found and there is nothing to recover.
+            graded_resource = LtiGradedResource.objects.filter(
+                lti_profile=lti_profile,
+                context_key=block_id,
+                lineitem=activity_lineitem.lineitem,
+                criterion_key='',
+            ).first()
+            if graded_resource is None:
+                log.warning(
+                    'LTI AGS: skipping LtiGradedResource for block %s: %s',
+                    block_id,
+                    exc.messages,
+                )
+                continue
+            resource_created = False
 
         # Same capture-and-backfill as handle_ags's own coupled record, and for the same
         # reason: resource_link_id/lineitems_url/context_id only exist on the launch request
@@ -305,7 +326,8 @@ def get_external_user_id(lti_profile: LtiProfile) -> Optional[str]:
 
     """
     try:
-        from lti_consumer.plugin import compat as lti_consumer_compat  # pylint: disable=import-outside-toplevel,import-error
+        from lti_consumer.plugin import \
+            compat as lti_consumer_compat  # pylint: disable=import-outside-toplevel,import-error
     except ImportError:
         return None
 
@@ -342,6 +364,17 @@ def relay_criterion_scores(
     that this only ever runs after `xblock-lti-consumer`'s own `publish_grade_on_score_update`
     succeeded (see `send_score_updates`, which is this function's only caller).
 
+    Each criterion is isolated from the others: a Moodle-side failure (timeout, revoked scope,
+    a since-deleted lineitem) for one criterion is logged and skipped rather than raised, so it
+    can't abort the remaining criteria for this block, the remaining coupled_resources for this
+    block (see `send_score_updates`'s own per-placement loop), or the ancestor levels above this
+    block in that same run. Also serves as this function's own AGS lineitem-scope guard: this
+    function has no explicit scope check of its own (unlike `handle_ags`'s explicit
+    `AGS_LINEITEM_SCOPE in ags_endpoint.get('scope', [])`), but a platform that never granted
+    lineitem-creation scope for this placement will have it rejected by the platform itself on
+    the `find_or_create_lineitem` call below — surfacing as `LtiException`, caught here the same
+    as any other per-criterion failure.
+
     Args:
         lti_profile: The launching user's LtiProfile.
         coupled_resource: This block's coupled (`criterion_key=''`) LtiGradedResource — the
@@ -367,7 +400,24 @@ def relay_criterion_scores(
     if not scores:
         return
 
+    if not coupled_resource.lineitems_url:
+        # Every pre-existing LtiGradedResource row has lineitems_url='' until this user's next
+        # relaunch (see handle_ags/setup_problem_lineitems's own backfill), and a coupled
+        # placement that never sends a `lineitems` claim at all keeps it '' forever. Without
+        # this guard, get_ags_for_lineitems_url below builds a JWT around an empty URL;
+        # pylti1p3's own lineitems-collection walk is then a silent no-op on it, and it falls
+        # through to a lineitem-create POST against that same empty URL — a MissingSchema
+        # failure that would abort this entire send_score_updates run, not just this relay.
+        log.warning(
+            'LTI AGS: skipping per-criterion relay for %s, no lineitems_url captured for user %s yet',
+            str(lti_configuration.location),
+            lti_profile.user_id,
+        )
+        return
+
+    from pylti1p3.exception import LtiException  # pylint: disable=import-outside-toplevel
     from pylti1p3.lineitem import LineItem  # pylint: disable=import-outside-toplevel
+    from requests.exceptions import RequestException  # pylint: disable=import-outside-toplevel
 
     ags = get_ags_for_lineitems_url(
         lti_profile.platform_id, lti_profile.client_id, coupled_resource.lineitems_url,
@@ -395,32 +445,44 @@ def relay_criterion_scores(
             continue
         criterion_label = line_item.label or criterion_key
 
-        activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
-            platform_id=lti_profile.platform_id,
-            resource_link_id=placement_key,
-            problem_id=block_id,
-            criterion_key=criterion_key,
-            defaults={
-                'context_id': coupled_resource.context_id,
-                # The launched Open edX resource, matching setup_problem_lineitems' own use of
-                # this field — not block_id (that's what problem_id already holds).
-                'resource_id': coupled_resource.context_key,
-                'label': f'{block_label} — {criterion_label}',
-            },
-        )
+        try:
+            activity_lineitem, created = LtiActivityLineitem.objects.get_or_create(
+                platform_id=lti_profile.platform_id,
+                resource_link_id=placement_key,
+                problem_id=block_id,
+                criterion_key=criterion_key,
+                defaults={
+                    'context_id': coupled_resource.context_id,
+                    # The launched Open edX resource, matching setup_problem_lineitems' own use
+                    # of this field — not block_id (that's what problem_id already holds).
+                    'resource_id': coupled_resource.context_key,
+                    'label': f'{block_label} — {criterion_label}',
+                },
+            )
 
-        if created or not activity_lineitem.lineitem:
-            lineitem = LineItem()
-            # Tag per (placement, problem, criterion) — same shape as setup_problem_lineitems'
-            # own tag, with the criterion appended so distinct criteria never share a lineitem.
-            lineitem.set_tag(f'{placement_key}:{block_id}:{criterion_key}')
-            lineitem.set_label(f'{block_label} — {criterion_label}')
-            # Normalized to percent (max 100), not the source line item's own score_maximum:
-            # Muzzy Lane's own possible-points can vary per learner (branching/looping), so only
-            # a percentage is safe to compare and post consistently across attempts.
-            lineitem.set_score_maximum(100.0)
-            activity_lineitem.lineitem = ags.find_or_create_lineitem(lineitem, find_by='tag').get_id()
-            activity_lineitem.save()
+            if created or not activity_lineitem.lineitem:
+                lineitem = LineItem()
+                # Tag per (placement, problem, criterion) — same shape as setup_problem_lineitems'
+                # own tag, with the criterion appended so distinct criteria never share a lineitem.
+                lineitem.set_tag(f'{placement_key}:{block_id}:{criterion_key}')
+                lineitem.set_label(f'{block_label} — {criterion_label}')
+                # Normalized to percent (max 100), not the source line item's own score_maximum:
+                # Muzzy Lane's own possible-points can vary per learner (branching/looping), so
+                # only a percentage is safe to compare and post consistently across attempts.
+                lineitem.set_score_maximum(100.0)
+                activity_lineitem.lineitem = ags.find_or_create_lineitem(lineitem, find_by='tag').get_id()
+                activity_lineitem.save()
+        except (LtiException, RequestException) as exc:
+            # A Moodle-side failure (missing scope, timeout, ...) creating this one criterion's
+            # lineitem must not stop the other criteria for this block — see this function's own
+            # docstring on error isolation.
+            log.error(
+                'LTI AGS: skipping per-criterion lineitem setup for block %s criterion %s: %s',
+                block_id,
+                criterion_key,
+                exc,
+            )
+            continue
 
         try:
             graded_resource, _created = LtiGradedResource.objects.get_or_create(
@@ -430,13 +492,26 @@ def relay_criterion_scores(
                 criterion_key=criterion_key,
             )
         except ValidationError as exc:
-            log.warning(
-                'LTI AGS: skipping per-criterion LtiGradedResource for block %s criterion %s: %s',
-                block_id,
-                criterion_key,
-                exc.messages,
-            )
-            continue
+            # A concurrent relay for the same user+block+criterion can win the insert between
+            # this get() and our own — full_clean()'s validate_unique then raises ValidationError
+            # here, unlike a plain IntegrityError, which is the only thing get_or_create itself
+            # retries on. Re-fetch by the same natural key: if this was that race, the other
+            # call's row is there now. If not (a genuinely malformed value), nothing is found and
+            # there is nothing to recover — skip this criterion, same as before.
+            graded_resource = LtiGradedResource.objects.filter(
+                lti_profile=lti_profile,
+                context_key=block_id,
+                lineitem=activity_lineitem.lineitem,
+                criterion_key=criterion_key,
+            ).first()
+            if graded_resource is None:
+                log.warning(
+                    'LTI AGS: skipping per-criterion LtiGradedResource for block %s criterion %s: %s',
+                    block_id,
+                    criterion_key,
+                    exc.messages,
+                )
+                continue
 
         # Cap at score_maximum (AGS allows a tool to send a score higher than its own declared
         # maximum) and convert to a percent — same capping `xblock-lti-consumer`'s own
@@ -448,7 +523,13 @@ def relay_criterion_scores(
             criterion_key,
             lti_profile.user_id,
         )
-        graded_resource.publish_score(percent, 100.0)
+        try:
+            graded_resource.publish_score(percent, 100.0)
+        except (LtiException, RequestException):
+            # Already logged in full (JWT, response, exception) by publish_score itself; here we
+            # only need to keep this one criterion's failure from stopping the rest — see this
+            # function's own docstring on error isolation.
+            continue
 
 
 @shared_task(name=f'{MODULE_PATH}.send_score_updates')
