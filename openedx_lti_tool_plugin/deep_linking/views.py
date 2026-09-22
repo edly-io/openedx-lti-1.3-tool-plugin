@@ -1,4 +1,5 @@
 """Django Views."""
+import logging
 from typing import Union
 from uuid import uuid4
 
@@ -22,8 +23,11 @@ from openedx_lti_tool_plugin.edxapp_wrapper.site_configuration_module import con
 from openedx_lti_tool_plugin.http import LoggedHttpResponseBadRequest
 from openedx_lti_tool_plugin.views import LTIToolView
 
+log = logging.getLogger(__name__)
+
 CUSTOM_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/custom'
 TARGET_LINK_URI_CLAIM = 'https://purl.imsglobal.org/spec/lti/claim/target_link_uri'
+DEEP_LINKING_SETTINGS_CLAIM = 'https://purl.imsglobal.org/spec/lti-dl/claim/deep_linking_settings'
 
 
 def get_scoped_course_id(launch_data: dict) -> str:
@@ -55,6 +59,32 @@ def get_scoped_course_id(launch_data: dict) -> str:
         return ''
 
     return candidate
+
+
+def accepts_multiple(launch_data: dict) -> bool:
+    """Return whether the platform accepts more than one content item in the response.
+
+    Reads the ``accept_multiple`` property of the Deep Linking Settings claim. The
+    property is optional and its absence means the platform expects a single content
+    item, so a missing claim or property is treated as False. Platforms are inconsistent
+    about JSON booleans, so the string forms sent by some of them are accepted too.
+
+    Args:
+        launch_data: Deep linking launch message data.
+
+    Returns:
+        True when the platform accepts several content items, False otherwise.
+
+    """
+    settings_claim = launch_data.get(DEEP_LINKING_SETTINGS_CLAIM, {}) or {}
+    raw_value = settings_claim.get('accept_multiple')
+    value = raw_value is True or str(raw_value).strip().lower() == 'true'
+
+    # Platforms do not expose this as a configurable setting (Moodle, for one, picks it
+    # per launch flow), so logging it is the only way to see what a launch asked for.
+    log.info('Deep linking launch accept_multiple: raw=%r resolved=%s', raw_value, value)
+
+    return value
 
 
 @method_decorator([csrf_exempt, xframe_options_exempt], name='dispatch')
@@ -158,6 +188,7 @@ class DeepLinkingFormView(LTIToolView):
                 {
                     'launch_id': launch_id,
                     'course_id': get_scoped_course_id(message.get_launch_data()),
+                    'accept_multiple': accepts_multiple(message.get_launch_data()),
                 },
             )
         except (LtiException, DeepLinkingException) as exc:
@@ -187,7 +218,10 @@ class DeepLinkingFormView(LTIToolView):
             # Validate message.
             validate_deep_linking_message(message)
             # Initialize form.
-            form = self.form_class(request.POST)
+            form = self.form_class(
+                request.POST,
+                accept_multiple=accepts_multiple(message.get_launch_data()),
+            )
             # Validate form.
             if not form.is_valid():
                 raise DeepLinkingException(form.errors)

@@ -1,6 +1,7 @@
 """Tests forms module."""
 from unittest.mock import MagicMock, patch
 
+from django.core.exceptions import ValidationError
 from django.test import TestCase
 
 from openedx_lti_tool_plugin.deep_linking.forms import DeepLinkingForm
@@ -75,3 +76,45 @@ class TestDeepLinkingForm(TestCase):
         deep_link_resource_mock().set_custom_params.assert_called_once_with(
             self.content_item['custom'],
         )
+
+    def test_accept_multiple_defaults_to_false(self):
+        """Test accept_multiple defaults to False."""
+        self.assertFalse(self.form_class().accept_multiple)
+
+    @patch(f'{MODULE_PATH}.DeepLinkResource')
+    def test_clean_with_multiple_content_items_not_accepted(
+        self,
+        deep_link_resource_mock: MagicMock,
+    ):
+        """Test clean method with several content items the platform does not accept."""
+        form = self.form_class(accept_multiple=False)
+        form.cleaned_data = {'content_items': [self.content_item, self.content_item]}
+
+        with self.assertRaises(ValidationError):
+            form.clean()
+
+        deep_link_resource_mock.assert_not_called()
+
+    @patch(f'{MODULE_PATH}.DeepLinkResource')
+    def test_clean_with_multiple_content_items_accepted(
+        self,
+        deep_link_resource_mock: MagicMock,
+    ):
+        """Test clean method with several content items the platform accepts."""
+        form = self.form_class(accept_multiple=True)
+        form.cleaned_data = {'content_items': [self.content_item, self.content_item]}
+
+        self.assertEqual(len(form.clean()['deep_link_resources']), 2)
+        self.assertEqual(deep_link_resource_mock.call_count, 2)
+
+    @patch(f'{MODULE_PATH}.DeepLinkResource')
+    def test_clean_without_content_items(
+        self,
+        deep_link_resource_mock: MagicMock,
+    ):
+        """Test clean method without content items."""
+        form = self.form_class()
+        form.cleaned_data = {}
+
+        self.assertEqual(form.clean()['deep_link_resources'], [])
+        deep_link_resource_mock.assert_not_called()

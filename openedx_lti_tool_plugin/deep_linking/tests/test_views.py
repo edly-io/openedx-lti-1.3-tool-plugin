@@ -14,9 +14,11 @@ from openedx_lti_tool_plugin.deep_linking.forms import DeepLinkingForm
 from openedx_lti_tool_plugin.deep_linking.tests import MODULE_PATH
 from openedx_lti_tool_plugin.deep_linking.views import (
     CUSTOM_CLAIM,
+    DEEP_LINKING_SETTINGS_CLAIM,
     TARGET_LINK_URI_CLAIM,
     DeepLinkingFormView,
     DeepLinkingView,
+    accepts_multiple,
     get_scoped_course_id,
 )
 
@@ -52,6 +54,44 @@ class TestGetScopedCourseId(TestCase):
     def test_empty_when_absent(self):
         """Returns '' when no course can be resolved."""
         self.assertEqual(get_scoped_course_id({}), '')
+
+
+class TestAcceptsMultiple(TestCase):
+    """Test accepts_multiple function."""
+
+    def test_true_boolean(self):
+        """Returns True for a JSON boolean true."""
+        data = {DEEP_LINKING_SETTINGS_CLAIM: {'accept_multiple': True}}
+        self.assertTrue(accepts_multiple(data))
+
+    def test_true_string(self):
+        """Returns True for the string forms some platforms send."""
+        for raw_value in ('true', 'True', ' TRUE '):
+            with self.subTest(raw_value=raw_value):
+                data = {DEEP_LINKING_SETTINGS_CLAIM: {'accept_multiple': raw_value}}
+                self.assertTrue(accepts_multiple(data))
+
+    def test_false_boolean(self):
+        """Returns False for a JSON boolean false."""
+        data = {DEEP_LINKING_SETTINGS_CLAIM: {'accept_multiple': False}}
+        self.assertFalse(accepts_multiple(data))
+
+    def test_false_string(self):
+        """Returns False for the string 'false'."""
+        data = {DEEP_LINKING_SETTINGS_CLAIM: {'accept_multiple': 'false'}}
+        self.assertFalse(accepts_multiple(data))
+
+    def test_property_absent(self):
+        """Returns False when the property is not in the settings claim."""
+        self.assertFalse(accepts_multiple({DEEP_LINKING_SETTINGS_CLAIM: {}}))
+
+    def test_claim_absent(self):
+        """Returns False when the settings claim is not in the launch data."""
+        self.assertFalse(accepts_multiple({}))
+
+    def test_claim_null(self):
+        """Returns False when the settings claim is null."""
+        self.assertFalse(accepts_multiple({DEEP_LINKING_SETTINGS_CLAIM: None}))
 
 
 @patch.object(DeepLinkingView, 'get_message')
@@ -158,12 +198,14 @@ class TestDeepLinkingFormViewGet(TestCase):
             reverse('1.3:deep-linking:form', args=[self.launch_id]),
         )
 
+    @patch(f'{MODULE_PATH}.accepts_multiple')
     @patch(f'{MODULE_PATH}.get_scoped_course_id')
     @patch(f'{MODULE_PATH}.render')
     def test_with_deep_linking_request(
         self,
         render_mock: MagicMock,
         get_scoped_course_id_mock: MagicMock,
+        accepts_multiple_mock: MagicMock,
         configuration_helpers_mock: MagicMock,
         validate_deep_linking_message_mock: MagicMock,
         get_message_from_cache_mock: MagicMock,
@@ -182,12 +224,16 @@ class TestDeepLinkingFormViewGet(TestCase):
         get_scoped_course_id_mock.assert_called_once_with(
             get_message_from_cache_mock().get_launch_data(),
         )
+        accepts_multiple_mock.assert_called_once_with(
+            get_message_from_cache_mock().get_launch_data(),
+        )
         render_mock.assert_called_once_with(
             self.request,
             configuration_helpers_mock().get_value(),
             {
                 'launch_id': self.launch_id,
                 'course_id': get_scoped_course_id_mock.return_value,
+                'accept_multiple': accepts_multiple_mock.return_value,
             },
         )
 
@@ -255,10 +301,12 @@ class TestDeepLinkingFormViewPost(TestCase):
             reverse('1.3:deep-linking:form', args=[self.launch_id]),
         )
 
+    @patch(f'{MODULE_PATH}.accepts_multiple')
     @patch(f'{MODULE_PATH}.HttpResponse')
     def test_with_deep_linking_request(
         self,
         http_response_mock: MagicMock,
+        accepts_multiple_mock: MagicMock,
         form_class_mock: MagicMock,
         validate_deep_linking_message_mock: MagicMock,
         get_message_from_cache_mock: MagicMock,
@@ -279,7 +327,10 @@ class TestDeepLinkingFormViewPost(TestCase):
         )
         get_message_from_cache_mock.assert_called_once_with(self.request, self.launch_id)
         validate_deep_linking_message_mock.assert_called_once_with(get_message_from_cache_mock())
-        form_class_mock.assert_called_once_with(self.request.POST)
+        form_class_mock.assert_called_once_with(
+            self.request.POST,
+            accept_multiple=accepts_multiple_mock.return_value,
+        )
         form_class_mock().is_valid.assert_called_once_with()
         get_message_from_cache_mock().get_deep_link.assert_called_once_with()
         get_message_from_cache_mock().get_deep_link().output_response_form.assert_called_once_with(
