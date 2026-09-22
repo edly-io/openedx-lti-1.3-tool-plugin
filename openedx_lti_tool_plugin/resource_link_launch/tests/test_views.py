@@ -66,7 +66,7 @@ class TestResourceLinkLaunchViewGet(ResourceLinkLaunchViewBaseTestCase):
             self.view_class().get(self.request),
             post_mock.return_value,
         )
-        post_mock.assert_called_once_with(self.request)
+        post_mock.assert_called_once_with(self.request, resource_id='')
 
 
 @patch.object(ResourceLinkLaunchView, 'try_get_message')
@@ -890,7 +890,6 @@ class TestResourceLinkLaunchViewEnroll(ResourceLinkLaunchViewBaseTestCase):
             user=self.user,
             course_key=COURSE_KEY,
             check_access=True,
-            request=None,
         )
 
     @patch(f'{MODULE_PATH}._')

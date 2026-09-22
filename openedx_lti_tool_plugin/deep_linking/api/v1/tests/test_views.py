@@ -191,7 +191,7 @@ class TestCourseBlockContentItemViewSet(TestCase):
         all_for_lti_tool_mock: MagicMock,
         course_key_mock: MagicMock,
         get_course_block_tree_mock: MagicMock,
-        reverse_mock: MagicMock,
+        reverse_mock: MagicMock,  # pylint: disable=unused-argument
     ):
         """Test list returns the block tree for an allowed course."""
         get_identity_claims_mock.return_value = ISS, AUD, None, None

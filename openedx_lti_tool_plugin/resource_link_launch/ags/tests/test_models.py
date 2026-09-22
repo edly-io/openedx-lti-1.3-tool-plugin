@@ -308,9 +308,9 @@ class TestLtiGradedResourcePublishScoreGuard(TestLtiGradedResourceBaseTestCase):
     def test_timestamp_evaluated_per_call(
         self,
         datetime_mock: MagicMock,
-        tool_conf_mock: MagicMock,
-        message_mock: MagicMock,
-        grade_mock: MagicMock,
+        tool_conf_mock: MagicMock,  # pylint: disable=unused-argument
+        message_mock: MagicMock,  # pylint: disable=unused-argument
+        grade_mock: MagicMock,  # pylint: disable=unused-argument
     ):
         """publish_score stamps each call with the current time.
 
@@ -323,9 +323,9 @@ class TestLtiGradedResourcePublishScoreGuard(TestLtiGradedResourceBaseTestCase):
 
     def test_skips_publish_when_score_unchanged(
         self,
-        tool_conf_mock: MagicMock,
+        tool_conf_mock: MagicMock,  # pylint: disable=unused-argument
         message_mock: MagicMock,
-        grade_mock: MagicMock,
+        grade_mock: MagicMock,  # pylint: disable=unused-argument
     ):
         """A second identical score is not re-sent to the platform."""
         self.lti_graded_resource.publish_score(0.5, 1.0)
@@ -336,9 +336,9 @@ class TestLtiGradedResourcePublishScoreGuard(TestLtiGradedResourceBaseTestCase):
 
     def test_publishes_again_when_score_changes(
         self,
-        tool_conf_mock: MagicMock,
+        tool_conf_mock: MagicMock,  # pylint: disable=unused-argument
         message_mock: MagicMock,
-        grade_mock: MagicMock,
+        grade_mock: MagicMock,  # pylint: disable=unused-argument
     ):
         """A changed score is sent again."""
         self.lti_graded_resource.publish_score(0.5, 1.0)

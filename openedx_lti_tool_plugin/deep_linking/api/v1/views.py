@@ -154,7 +154,7 @@ class CourseBlockContentItemViewSet(DeepLinkingViewSet):
 
     authentication_classes = (JwtAuthentication,)
 
-    def list(self, request, *args, **kwargs) -> Response:  # pylint: disable=unused-argument
+    def list(self, request, *args, **kwargs) -> Response:
         """Return the block outline for the requested course.
 
         Args:
