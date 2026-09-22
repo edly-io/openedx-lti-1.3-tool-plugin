@@ -97,7 +97,7 @@ class TestSendScoreUpdates(TestCase):
         self.course_id = COURSE_ID
         self.problem_id = USAGE_KEY
         self.course_grade = MagicMock()
-        self.course_grade.score_for_module.return_value = (1, 1)
+        self.course_grade.score_for_block.return_value = (1, 1)
         self.graded_resource = MagicMock()
 
     def _leaf_then_course(self):
@@ -133,7 +133,7 @@ class TestSendScoreUpdates(TestCase):
             user_id=self.user_id,
             context_key=str(leaf.location),
         )
-        self.course_grade.score_for_module.assert_called_once_with(leaf.location)
+        self.course_grade.score_for_block.assert_called_once_with(leaf.location)
         self.graded_resource.publish_score.assert_called_once_with(1, 1)
 
     def test_without_lti_profile(
