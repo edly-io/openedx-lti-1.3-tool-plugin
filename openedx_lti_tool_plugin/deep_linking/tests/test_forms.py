@@ -62,7 +62,9 @@ class TestDeepLinkingForm(TestCase):
         form.cleaned_data = {'content_items': [self.content_item]}
 
         self.assertEqual(form.clean(), form.cleaned_data)
-        super_mock.assert_called_once_with()
+        # super() is called twice under this patch: by __init__ and by clean.
+        self.assertEqual(super_mock.call_count, 2)
+        super_mock.assert_called_with()
         deep_link_resource_mock.assert_called_once_with()
         deep_link_resource_mock().set_type.assert_called_once_with(
             self.content_item['type'],

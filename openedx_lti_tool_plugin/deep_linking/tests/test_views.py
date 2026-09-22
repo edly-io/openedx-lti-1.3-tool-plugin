@@ -93,6 +93,12 @@ class TestAcceptsMultiple(TestCase):
         """Returns False when the settings claim is null."""
         self.assertFalse(accepts_multiple({DEEP_LINKING_SETTINGS_CLAIM: None}))
 
+    def test_claim_not_an_object(self):
+        """Returns False without raising when the settings claim is not an object."""
+        for claim in ('true', ['accept_multiple'], 1):
+            with self.subTest(claim=claim):
+                self.assertFalse(accepts_multiple({DEEP_LINKING_SETTINGS_CLAIM: claim}))
+
 
 @patch.object(DeepLinkingView, 'get_message')
 @patch(f'{MODULE_PATH}.validate_deep_linking_message')
@@ -340,10 +346,12 @@ class TestDeepLinkingFormViewPost(TestCase):
             get_message_from_cache_mock().get_deep_link().output_response_form(),
         )
 
+    @patch(f'{MODULE_PATH}.accepts_multiple')
     @patch.object(DeepLinkingFormView, 'http_response_error')
     def test_with_invalid_form(
         self,
         http_response_error_mock: MagicMock,
+        accepts_multiple_mock: MagicMock,
         form_class_mock: MagicMock,
         validate_deep_linking_message_mock: MagicMock,
         get_message_from_cache_mock: MagicMock,
@@ -357,7 +365,10 @@ class TestDeepLinkingFormViewPost(TestCase):
         )
         get_message_from_cache_mock.assert_called_once_with(self.request, self.launch_id)
         validate_deep_linking_message_mock.assert_called_once_with(get_message_from_cache_mock())
-        form_class_mock.assert_called_once_with(self.request.POST)
+        form_class_mock.assert_called_once_with(
+            self.request.POST,
+            accept_multiple=accepts_multiple_mock.return_value,
+        )
         form_class_mock().is_valid.assert_called_once_with()
         get_message_from_cache_mock().get_deep_link.assert_not_called()
         get_message_from_cache_mock().get_deep_link().output_response_form.assert_not_called()

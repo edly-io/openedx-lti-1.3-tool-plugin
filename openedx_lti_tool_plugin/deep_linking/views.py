@@ -76,8 +76,10 @@ def accepts_multiple(launch_data: dict) -> bool:
         True when the platform accepts several content items, False otherwise.
 
     """
-    settings_claim = launch_data.get(DEEP_LINKING_SETTINGS_CLAIM, {}) or {}
-    raw_value = settings_claim.get('accept_multiple')
+    settings_claim = launch_data.get(DEEP_LINKING_SETTINGS_CLAIM) or {}
+    # A platform sending something other than an object for the claim would otherwise
+    # crash on .get, turning a malformed launch into a 500 instead of an error page.
+    raw_value = settings_claim.get('accept_multiple') if isinstance(settings_claim, dict) else None
     value = raw_value is True or str(raw_value).strip().lower() == 'true'
 
     # Platforms do not expose this as a configurable setting (Moodle, for one, picks it
