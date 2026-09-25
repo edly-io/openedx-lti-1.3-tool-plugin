@@ -24,7 +24,7 @@
   <div id='blocksView' style='display:none'>
     <button type='button' id='backToCourses' class='dlp-back'>&larr; {% translate 'Back to courses' %}</button>
     <h1 class='dlp-title'>{% translate 'Select content from' %} <span id='selectedCourseTitle'></span></h1>
-    <p class='dlp-subtitle'>{% translate 'Select course, subsection, unit, or component to embed. Selecting a parent embeds all the content beneath it.' %}</p>
+    <p class='dlp-subtitle'>{% translate 'Select course, subsection, unit, or component to embed. Selecting a parent embeds all the content beneath it.' %}{% if not accept_multiple %} {% translate 'This platform accepts one item, so selecting another replaces your current selection.' %}{% endif %}</p>
     <hr class='dlp-divider'>
     <form
       id='deepLinkingForm'
@@ -51,18 +51,43 @@
   const courseListUrl = '{% url "openedx_lti_tool_plugin:1.3:deep-linking:api:v1:course-content-item-list" launch_id=launch_id %}';
   // When the launch resolves to a single course, the picker is scoped to it.
   const scopedCourseId = '{{ course_id|escapejs }}';
+  // The platform's accept_multiple Deep Linking setting: when false, the picker holds
+  // one selection at a time so it cannot promise more than the response may carry.
+  const acceptMultiple = {{ accept_multiple|yesno:"true,false" }};
+  const oneItemWord = '{% translate "1 item selected" %}';
   const itemsWord = '{% translate "items selected" %}';
 
   // Human-readable type labels for the right-aligned badge.
   const BLOCK_LABELS = {
     course: '{% translate "Course" %}',
-    chapter: '{% translate "Chapter" %}',
+    chapter: '{% translate "Section" %}',
     sequential: '{% translate "Subsection" %}',
     vertical: '{% translate "Unit" %}',
     html: '{% translate "HTML" %}',
     problem: '{% translate "Problem" %}',
     video: '{% translate "Video" %}',
+    lti_consumer: '{% translate "LTI XBlock" %}',
+    discussion: '{% translate "Discussion" %}',
+    openassessment: '{% translate "Open Response Assessment" %}',
+    drag_and_drop_v2: '{% translate "Drag and Drop" %}',
+    library_content: '{% translate "Library Content" %}',
+    word_cloud: '{% translate "Word Cloud" %}',
+    annotatable: '{% translate "Annotatable" %}',
+    poll: '{% translate "Poll" %}',
+    survey: '{% translate "Survey" %}',
+    conditional: '{% translate "Conditional" %}',
+    split_test: '{% translate "Content Experiment" %}',
   };
+
+  // Fallback for XBlocks with no entry above: 'scorm_xblock' -> 'Scorm Xblock', so a raw
+  // modulestore block type never reaches the badge.
+  function titleCase(category) {
+    return String(category || '')
+      .split(/[_-]+/)
+      .filter(Boolean)
+      .map(function(word) { return word.charAt(0).toUpperCase() + word.slice(1); })
+      .join(' ');
+  }
 
   // Inline SVG icons (inherit currentColor, so they turn blue when a row is selected).
   const CHEVRON_SVG =
@@ -132,9 +157,12 @@
   // Selecting any node makes it the sole selection on its root-to-leaf path:
   //  - it deselects any selected ancestor (selecting a child/parent clears its parents), and
   //  - it deselects any selected descendant (so the same content is never embedded twice).
-  // Unrelated selections (neither ancestor nor descendant) are left untouched.
+  // Unrelated selections (neither ancestor nor descendant) survive only when the platform
+  // accepts multiple content items; otherwise the whole set is replaced.
   function toggle(node, checked) {
     if (checked) {
+      // One item at a time: the new pick replaces whatever was selected before.
+      if (!acceptMultiple) { selected.clear(); }
       clearAncestors(node);
       clearDescendants(node);
       selected.add(node.id);
@@ -197,7 +225,7 @@
     // Type badge.
     const badge = document.createElement('span');
     badge.className = 'dlp-badge';
-    badge.textContent = BLOCK_LABELS[node.category] || node.category;
+    badge.textContent = BLOCK_LABELS[node.category] || titleCase(node.category);
     row.appendChild(badge);
 
     if (selected.has(node.id)) { row.classList.add('sel-direct'); }
@@ -232,7 +260,7 @@
 
   function updateFooter() {
     const n = selected.size;
-    document.getElementById('selCount').textContent = n + ' ' + itemsWord;
+    document.getElementById('selCount').textContent = (n === 1) ? oneItemWord : (n + ' ' + itemsWord);
     document.getElementById('submitBtn').disabled = (n === 0);
   }
 
